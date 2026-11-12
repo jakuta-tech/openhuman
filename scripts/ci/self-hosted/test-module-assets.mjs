@@ -2,12 +2,11 @@
 // Resolve the native test-module release assets the Rust coverage lane needs,
 // straight from the compiled module registry (the authoritative pin).
 //
-// Usage: node scripts/ci/self-hosted/test-module-assets.mjs [host_key]
+// Usage: node scripts/ci/self-hosted/test-module-assets.mjs [host_key] [id,...]
 // Prints one line per module: `<id>\t<url>\t<archive>\t<sha256>`.
 //
 // Reading the registry instead of copying version + digest into a workflow
-// keeps a single source of truth: ci-lite.yml carries its own copies, and its
-// tinyjuice copy had already drifted (0.2.2 there, 0.2.5 in the registry).
+// provides the authoritative release asset metadata for test fixtures.
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +17,25 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const REGISTRY_DIR = join(ROOT, "crates/openhuman-core/src/modules");
 
 /** Test modules the core suite loads, by registry record id. */
-export const TEST_MODULE_IDS = ["tinymemory", "tinyjuice"];
+export const TEST_MODULE_IDS = [
+  "tinyjuice",
+  "tinybox",
+  "tinysearch",
+  "tinydocs",
+  "tinywallet",
+  "tinychannels",
+  "tinymcp",
+  "tinyeventqueues",
+  "tinyhosts",
+  "tinyconnectors",
+  "tinyflows",
+  "tinyvoice",
+  // The core test suite exercises keyring and privacy decisions with the
+  // pinned TinySecurity module. It is loaded through the verified local-file
+  // callback path, so the CI installer must stage it alongside the modules
+  // that use the regular release search path.
+  "tinysecurity",
+];
 
 /** Concatenate registry.rs and its `registry/records_*.rs` fragments. */
 export function readRegistrySource(dir = REGISTRY_DIR) {
@@ -63,7 +80,11 @@ export function resolveTestModuleAssets(src, hostKey, ids = TEST_MODULE_IDS) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const hostKey = process.argv[2] ?? "ubuntu-22.04-x86_64";
-  for (const a of resolveTestModuleAssets(readRegistrySource(), hostKey)) {
+  for (const a of resolveTestModuleAssets(
+    readRegistrySource(),
+    hostKey,
+    process.argv[3]?.split(","),
+  )) {
     console.log([a.id, a.url, a.archive, a.sha256].join("\t"));
   }
 }

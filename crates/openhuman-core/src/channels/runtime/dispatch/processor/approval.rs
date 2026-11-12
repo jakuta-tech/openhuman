@@ -1,28 +1,23 @@
-//! Gating and intercepting approval-gate replies on channels that have a
-//! registered approval surface.
+//! Gating and intercepting approval-gate replies on channels that surface
+//! approvals in chat.
 
-use crate::channels::context::conversation_history_key;
-use crate::channels::providers::telegram::TELEGRAM_APPROVAL_CLIENT_ID;
-use crate::channels::traits;
+use tinychannels_bus as traits;
 
-/// Whether a channel currently has a registered approval surface — i.e.
-/// a subscriber that turns `ApprovalRequested` events into chat messages
-/// and a way for the user's reply to flow back into the
-/// [`ApprovalGate`]. When `true`, the dispatch loop scopes the agent
-/// turn in an [`ApprovalChatContext`] so the gate actually fires for
-/// `Prompt`-class tools and intercepts yes/no replies for parked
-/// approvals.
+/// Whether a channel surfaces approvals in chat: the
+/// `ChannelApprovalSurfaceSubscriber` turns `ApprovalRequested` events into
+/// chat messages and the user's reply flows back into the [`ApprovalGate`].
+/// When `true`, the dispatch loop scopes the agent turn in an
+/// [`ApprovalChatContext`] so the gate actually fires for `Prompt`-class tools,
+/// and intercepts yes/no replies for parked approvals.
 ///
-/// Only Telegram has a surface today (sub-issue 2 of #3098). Discord /
-/// Slack / iMessage / Mattermost remain in the legacy "no chat context
-/// → silently allow" state until each gets a per-channel surface in a
-/// follow-up PR; surfacing approvals there without a subscriber would
-/// just TTL-deny every parked call, which is worse than the status quo.
+/// Driven by the provider's `chat_approvals` capability. Channels without it
+/// (email, CLI, webhooks) keep the "no chat context → allow" behaviour, since
+/// a prompt there would only TTL-deny every parked call.
 ///
 /// [`ApprovalChatContext`]: crate::security::approval::ApprovalChatContext
 /// [`ApprovalGate`]: crate::security::approval::ApprovalGate
 pub(crate) fn channel_has_approval_surface(channel: &str) -> bool {
-    channel == TELEGRAM_APPROVAL_CLIENT_ID
+    crate::channels::capabilities::capabilities_for(channel).chat_approvals
 }
 
 /// If the inbound message is a yes/no reply for a parked approval on
@@ -33,12 +28,14 @@ pub(crate) fn channel_has_approval_surface(channel: &str) -> bool {
 /// `web_chat/`.
 ///
 /// [`ApprovalGate::decide`]: crate::security::approval::ApprovalGate::decide
-pub(super) async fn try_route_approval_reply(msg: &traits::ChannelMessage) -> bool {
+pub(super) async fn try_route_approval_reply(
+    msg: &traits::ChannelMessage,
+    thread_id: &str,
+) -> bool {
     let Some(gate) = crate::security::approval::ApprovalGate::try_global() else {
         return false;
     };
-    let thread_id = conversation_history_key(msg);
-    let Some(request_id) = gate.pending_for_thread(&thread_id) else {
+    let Some(request_id) = gate.pending_for_thread(thread_id) else {
         return false;
     };
     let Some(decision) = crate::security::approval::parse_approval_reply(&msg.content) else {

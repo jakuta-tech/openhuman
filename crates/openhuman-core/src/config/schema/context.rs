@@ -1,165 +1,227 @@
-//! Context management configuration.
+//! The `[context]` table: TinyAgents-owned context settings, re-exported
+//! through OpenHuman's config API, plus the summarizer settings OpenHuman adds
+//! beside them.
 //!
-//! Knobs for the global `crates/openhuman-core/src/agent/context/` module — budget
-//! thresholds, summarization trigger percentages, microcompact behavior,
-//! and the session-memory extraction cadence. Wired into the root
-//! [`super::Config`] as the `context` section; env overrides live in
-//! [`super::load`].
+//! OpenHuman keeps its product-specific environment overlays in
+//! [`super::load`], while the shared settings, defaults, parsing, and
+//! serialization contract live with TinyAgents. [`ContextSettings`] flattens
+//! TinyAgents' [`ContextConfig`] and adds OpenHuman's own keys to the same
+//! table, so `config.context.<harness field>` keeps reading through `Deref`.
 
-use crate::agent::context::session_memory::SessionMemoryConfig;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Top-level context-management config. All fields are optional in
-/// `config.toml` and fall back to the defaults shipped in
-/// [`ContextConfig::default`].
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct ContextConfig {
-    /// Master switch. When `false`, [`crate::agent::context::ContextManager`]
-    /// skips every reduction stage and the summarizer is never invoked.
-    /// Useful for tests and diagnostics; not recommended for production.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
+pub use tinyagents_harness::config::{CompactionSettings, CompactionStrategy, ContextConfig};
+use tinyagents_harness::summarization::ToolRendering;
 
-    /// Enable stage 3 (microcompact) — clearing older `ToolResults`
-    /// payloads to free tokens before falling back to summarization.
-    #[serde(default = "default_true")]
-    pub microcompact_enabled: bool,
-
-    /// Enable stage 4 (autocompact) — install the TinyAgents summarization
-    /// middleware when the transcript approaches the model context window.
-    #[serde(default = "default_true")]
-    pub autocompact_enabled: bool,
-
-    /// How many of the most-recent `ToolResults` envelopes microcompact
-    /// leaves untouched when it runs. Older envelopes are cleared first.
-    #[serde(default = "default_microcompact_keep_recent")]
-    pub microcompact_keep_recent: usize,
-
-    /// Maximum byte length of a single tool-result body before the
-    /// TinyAgents tool-output middleware budget stage truncates it.
-    /// `0` disables the cap. Applied inline at tool-execution time
-    /// before the result enters history, so it is cache-safe.
-    ///
-    /// **Migration note:** this field used to live on
-    /// [`super::AgentConfig::tool_result_budget_bytes`]. It has moved
-    /// here because it is logically a context-reduction knob. A
-    /// compatibility `#[serde(alias)]` on `AgentConfig` keeps existing
-    /// `config.toml` files parsing cleanly during the transition.
-    #[serde(default = "default_tool_result_budget_bytes")]
-    pub tool_result_budget_bytes: usize,
-
-    /// Tool results larger than this **token** count trigger the
-    /// `summarizer` sub-agent (orchestrator session only). The summarizer
-    /// compresses the payload into a dense note that preserves
-    /// identifiers and key facts, and the compressed summary replaces
-    /// the raw payload before it enters agent history. Default: 4000 tokens.
-    /// Set to 0 to disable.
-    ///
-    /// Token count is estimated as `chars / 4` (the same heuristic used
-    /// by `tree_summarizer::estimate_tokens`). Pairs with
-    /// [`Self::summarizer_max_payload_tokens`] which caps the upper end
-    /// (paying for an LLM call on a multi-million-token blob makes no
-    /// economic sense, so above the cap the existing
-    /// [`Self::tool_result_budget_bytes`] truncation handles it instead).
-    #[serde(
-        default = "default_summarizer_payload_threshold_tokens",
-        alias = "summarizer_payload_threshold_bytes"
-    )]
-    pub summarizer_payload_threshold_tokens: usize,
-
-    /// Hard cap on payload size (in **tokens**) above which summarization
-    /// is skipped entirely and the existing
-    /// [`Self::tool_result_budget_bytes`] truncation path takes over.
-    /// Default: `2_000_000` tokens (above the context window of every
-    /// model we ship against — a payload this big can't be summarized
-    /// cost-effectively).
-    #[serde(
-        default = "default_summarizer_max_payload_tokens",
-        alias = "summarizer_max_payload_bytes"
-    )]
-    pub summarizer_max_payload_tokens: usize,
-
-    /// Session-memory extraction thresholds.
-    #[serde(default)]
-    pub session_memory: SessionMemoryConfig,
-
-    /// Override for the model used by the summarizer when autocompaction
-    /// fires. `None` (the default) means "use the caller's current
-    /// model"; set this to a cheaper/faster model to reduce the cost of
-    /// summarization on long sessions.
-    #[serde(default)]
-    pub summarizer_model: Option<String>,
-
-    /// When `true`, the agent loop asks tools to render their results as
-    /// markdown instead of JSON before they enter LLM context. Tools that
-    /// support it populate `ToolResult::markdown_formatted`; the harness
-    /// prefers that field over the JSON fallback. Markdown is materially
-    /// cheaper than JSON in tokens, especially on tool-heavy loops.
-    /// Default: `true` — opt out per-deployment via config or env if a
-    /// downstream consumer expects strict JSON tool output.
-    #[serde(default = "default_true")]
-    pub prefer_markdown_tool_output: bool,
-
-    /// Switch for tokenjuice tool-output compaction (Stage 1a). When `true`,
-    /// large structured tool outputs (build/test logs, diffs, JSON arrays) are
-    /// content-aware compressed *before* the [`Self::tool_result_budget_bytes`]
-    /// byte cap and before they enter history, with a `⟦tj:<hash>⟧` marker the
-    /// model can redeem through `tinyjuice_retrieve`.
-    ///
-    /// **Off by default** since the 2026-09 latency work: in practice the
-    /// compacted view cost the model a retrieval round trip more often than it
-    /// saved context, and every curated belt paid for the retrieve tool's
-    /// schema on every turn. The per-tool char cap and the shared byte
-    /// backstop (which persists oversized output for `file_read`) stay on.
-    /// Turn it back on via config or `OPENHUMAN_COMPACTION=1`.
-    #[serde(default)]
-    pub compaction_enabled: bool,
+/// Which turns' reasoning a request replays (`[context] replay_reasoning`).
+///
+/// The config's own copy of the runtime policy, so the schema does not
+/// re-export a TinyAgents type. It serializes with the same names
+/// (`all` | `current_turn`), and the runtime reads it through
+/// `From<ReasoningReplay>` where a run is configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplay {
+    /// Every assistant message keeps its reasoning blocks (today's behaviour).
+    #[default]
+    All,
+    /// Only the current turn's reasoning is sent; reasoning from completed
+    /// user turns is omitted from the request.
+    CurrentTurn,
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_microcompact_keep_recent() -> usize {
-    crate::agent::context::DEFAULT_KEEP_RECENT_TOOL_RESULTS
-}
-
-fn default_tool_result_budget_bytes() -> usize {
-    crate::agent::context::DEFAULT_TOOL_RESULT_BUDGET_BYTES
-}
-
-fn default_summarizer_payload_threshold_tokens() -> usize {
-    // Re-enabled at 4000 tokens after the recursive-dispatch root cause
-    // was fixed by the narrow sub-agent prompt built for the
-    // summarizer archetype (which prevents it from seeing `spawn_subagent`
-    // and thus cannot recurse). 0 would leave this entirely disabled.
-    4000
-}
-
-fn default_summarizer_max_payload_tokens() -> usize {
-    2_000_000
-}
-
-impl Default for ContextConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_enabled(),
-            microcompact_enabled: default_true(),
-            autocompact_enabled: default_true(),
-            microcompact_keep_recent: default_microcompact_keep_recent(),
-            tool_result_budget_bytes: default_tool_result_budget_bytes(),
-            summarizer_payload_threshold_tokens: default_summarizer_payload_threshold_tokens(),
-            summarizer_max_payload_tokens: default_summarizer_max_payload_tokens(),
-            session_memory: SessionMemoryConfig::default(),
-            summarizer_model: None,
-            prefer_markdown_tool_output: default_true(),
-            compaction_enabled: false,
+impl From<ReasoningReplay> for tinyagents_harness::reasoning_replay::ReasoningReplay {
+    fn from(replay: ReasoningReplay) -> Self {
+        match replay {
+            ReasoningReplay::All => Self::All,
+            ReasoningReplay::CurrentTurn => Self::CurrentTurn,
         }
     }
+}
+
+/// The whole `[context]` table: TinyAgents' [`ContextConfig`] and the
+/// compaction summarizer's OpenHuman-side settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextSettings {
+    /// TinyAgents' context settings, flattened into the same table.
+    #[serde(flatten)]
+    pub harness: ContextConfig,
+    /// How the compaction summarizer sees tool activity: `full` (every call
+    /// and result) or `markers` (one `[used <tool>: …]` line per call, no
+    /// results), for small summarization models. Env:
+    /// `OPENHUMAN_CONTEXT_SUMMARIZER_TOOL_RENDERING`.
+    #[serde(default)]
+    pub summarizer_tool_rendering: ToolRendering,
+    /// Output cap for each summary, sent as the request's `max_tokens`. Unset
+    /// leaves the provider default. Env:
+    /// `OPENHUMAN_CONTEXT_SUMMARIZER_MAX_OUTPUT_TOKENS` (`0` clears it).
+    #[serde(default)]
+    pub summarizer_max_output_tokens: Option<u32>,
+    /// Verbatim tail, in tokens, an in-turn compaction keeps after its
+    /// summary. Unset keeps 20,000 (capped at a fifth of the context window).
+    /// An embedder sets it per session (`AgentSpec::keep_recent_tokens`). Env:
+    /// `OPENHUMAN_CONTEXT_KEEP_RECENT_TOKENS` (`0` clears it).
+    #[serde(default)]
+    pub keep_recent_tokens: Option<u32>,
+    /// Replace a tool result older than this many user turns with a one-line
+    /// note, at the start of each run. Unset (or `0`) keeps every result, as
+    /// before. Pinned on each thread when it is created: a running thread keeps
+    /// the value it started with. Env: `OPENHUMAN_CONTEXT_TOOL_RESULT_MAX_AGE_TURNS`.
+    #[serde(default)]
+    pub tool_result_max_age_turns: Option<u32>,
+    /// Tools whose results never expire, by exact name. Only read while
+    /// `tool_result_max_age_turns` is set. Env:
+    /// `OPENHUMAN_CONTEXT_TOOL_RESULT_EXEMPT_TOOLS` (comma separated).
+    #[serde(default)]
+    pub tool_result_exempt_tools: Vec<String>,
+    /// Which turns' reasoning a request replays: `all` (today's behaviour) or
+    /// `current_turn`. The stored transcript always keeps every block. Pinned
+    /// on each thread when it is created. Env: `OPENHUMAN_CONTEXT_REPLAY_REASONING`.
+    #[serde(default)]
+    pub replay_reasoning: ReasoningReplay,
+    /// Drop a recorded tool declaration the host no longer offers instead of
+    /// carrying it forward for the life of the thread. Env:
+    /// `OPENHUMAN_CONTEXT_PRUNE_RETIRED_TOOLS`.
+    #[serde(default)]
+    pub prune_retired_tools: bool,
+}
+
+impl ContextSettings {
+    /// The summarizer settings a compaction applies.
+    pub fn summarizer_settings(&self) -> SummarizerSettings {
+        SummarizerSettings {
+            tool_rendering: self.summarizer_tool_rendering,
+            max_output_tokens: self.summarizer_max_output_tokens,
+        }
+    }
+}
+
+/// Per-session overrides of the `[context]` keys an embedder may set for one
+/// agent or one thread. A field left `None` keeps the config's value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextOverrides {
+    /// Replaces [`ContextSettings::keep_recent_tokens`].
+    pub keep_recent_tokens: Option<u32>,
+    /// Replaces [`ContextSettings::tool_result_max_age_turns`].
+    pub tool_result_max_age_turns: Option<u32>,
+    /// Replaces [`ContextSettings::tool_result_exempt_tools`].
+    pub tool_result_exempt_tools: Option<Vec<String>>,
+    /// Replaces [`ContextSettings::replay_reasoning`].
+    pub replay_reasoning: Option<ReasoningReplay>,
+    /// Replaces [`ContextSettings::prune_retired_tools`].
+    pub prune_retired_tools: Option<bool>,
+}
+
+impl ContextOverrides {
+    /// Writes every override that is set into `settings`.
+    pub fn apply_to(&self, settings: &mut ContextSettings) {
+        if let Some(tokens) = self.keep_recent_tokens {
+            settings.keep_recent_tokens = Some(tokens);
+        }
+        if let Some(age) = self.tool_result_max_age_turns {
+            settings.tool_result_max_age_turns = Some(age);
+        }
+        if let Some(tools) = &self.tool_result_exempt_tools {
+            settings.tool_result_exempt_tools = tools.clone();
+        }
+        if let Some(replay) = self.replay_reasoning {
+            settings.replay_reasoning = replay;
+        }
+        if let Some(prune) = self.prune_retired_tools {
+            settings.prune_retired_tools = prune;
+        }
+    }
+}
+
+impl std::ops::Deref for ContextSettings {
+    type Target = ContextConfig;
+
+    fn deref(&self) -> &ContextConfig {
+        &self.harness
+    }
+}
+
+impl std::ops::DerefMut for ContextSettings {
+    fn deref_mut(&mut self) -> &mut ContextConfig {
+        &mut self.harness
+    }
+}
+
+/// How the free-form compaction summarizer renders its input and caps its
+/// output (`[context] summarizer_tool_rendering` /
+/// `summarizer_max_output_tokens`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SummarizerSettings {
+    /// How tool calls and results reach the summarizer.
+    pub tool_rendering: ToolRendering,
+    /// The summary's `max_tokens`; `None` leaves the provider default.
+    pub max_output_tokens: Option<u32>,
+}
+
+/// JSON-schema view of TinyAgents' serialized context settings.
+///
+/// The harness type deliberately stays independent from `schemars`; this
+/// mirror keeps OpenHuman's generated config schema complete without adding a
+/// documentation dependency to the owning crate.
+#[derive(schemars::JsonSchema)]
+pub(crate) struct ContextConfigSchema {
+    enabled: bool,
+    microcompact_enabled: bool,
+    autocompact_enabled: bool,
+    microcompact_keep_recent: usize,
+    tool_result_budget_bytes: usize,
+    summarizer_payload_threshold_tokens: usize,
+    summarizer_max_payload_tokens: usize,
+    /// The model the context-compaction summarizer calls, on the turn's own
+    /// provider route (same credentials and endpoint): on a BYOK OpenRouter
+    /// route, `"scaledown/summarize"` calls that model on OpenRouter. Unset
+    /// or blank, compaction uses the turn's model. Env:
+    /// `OPENHUMAN_CONTEXT_SUMMARIZER_MODEL`.
+    summarizer_model: Option<String>,
+    /// How the summarizer sees tool activity: `full` or `markers`. Env:
+    /// `OPENHUMAN_CONTEXT_SUMMARIZER_TOOL_RENDERING`.
+    summarizer_tool_rendering: ToolRenderingSchema,
+    /// The summary's `max_tokens`; unset leaves the provider default. Env:
+    /// `OPENHUMAN_CONTEXT_SUMMARIZER_MAX_OUTPUT_TOKENS`.
+    summarizer_max_output_tokens: Option<u32>,
+    /// Verbatim tail an in-turn compaction keeps, in tokens; unset keeps
+    /// 20,000. Env: `OPENHUMAN_CONTEXT_KEEP_RECENT_TOKENS`.
+    keep_recent_tokens: Option<u32>,
+    /// Replace a tool result older than this many user turns with a one-line
+    /// note; unset or `0` keeps every result. Env:
+    /// `OPENHUMAN_CONTEXT_TOOL_RESULT_MAX_AGE_TURNS`.
+    tool_result_max_age_turns: Option<u32>,
+    /// Tools whose results never expire. Env:
+    /// `OPENHUMAN_CONTEXT_TOOL_RESULT_EXEMPT_TOOLS`.
+    tool_result_exempt_tools: Vec<String>,
+    /// `all` or `current_turn`. Env: `OPENHUMAN_CONTEXT_REPLAY_REASONING`.
+    replay_reasoning: ReasoningReplaySchema,
+    /// Drop recorded tool declarations the host no longer offers. Env:
+    /// `OPENHUMAN_CONTEXT_PRUNE_RETIRED_TOOLS`.
+    prune_retired_tools: bool,
+    prefer_markdown_tool_output: bool,
+    compaction_enabled: bool,
+    compaction_trigger_tokens: Option<u64>,
+    compaction_strategy: CompactionStrategySchema,
+}
+
+#[derive(schemars::JsonSchema)]
+#[schemars(rename_all = "snake_case")]
+enum CompactionStrategySchema {
+    TaskState,
+    Summary,
+}
+
+#[derive(schemars::JsonSchema)]
+#[schemars(rename_all = "snake_case")]
+enum ReasoningReplaySchema {
+    All,
+    CurrentTurn,
+}
+
+#[derive(schemars::JsonSchema)]
+#[schemars(rename_all = "snake_case")]
+enum ToolRenderingSchema {
+    Full,
+    Markers,
 }

@@ -30,6 +30,10 @@ impl CostDashboardTool {
 
 #[async_trait]
 impl Tool for CostDashboardTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "cost_get_dashboard"
     }
@@ -66,6 +70,10 @@ impl CostDailyHistoryTool {
 
 #[async_trait]
 impl Tool for CostDailyHistoryTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "cost_get_daily_history"
     }
@@ -115,6 +123,10 @@ impl CostSummaryTool {
 
 #[async_trait]
 impl Tool for CostSummaryTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "cost_get_summary"
     }
@@ -136,6 +148,17 @@ impl Tool for CostSummaryTool {
     fn is_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
         true
     }
+}
+
+/// Build this domain's tools in their persisted catalogue order.
+pub(crate) fn registered_tools(
+    config: std::sync::Arc<crate::config::Config>,
+) -> Vec<Box<dyn tinytools::Tool>> {
+    vec![
+        Box::new(CostDashboardTool::new(config.clone())),
+        Box::new(CostDailyHistoryTool::new(config.clone())),
+        Box::new(CostSummaryTool::new(config.clone())),
+    ]
 }
 
 #[cfg(test)]

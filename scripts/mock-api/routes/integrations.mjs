@@ -3,8 +3,20 @@ import { behavior, parseBehaviorJson, setMockBehavior } from "../state.mjs";
 import { listMockLlmModels } from "./llm/shared.mjs";
 
 // The web E2E core must never fetch the public Hermes catalog. Keep the
-// fixture small but representative: registry smoke tests need sources and
-// browse results, while search tests need both `git` and `docker` matches.
+// fixture representative: registry smoke tests need sources and browse
+// results, search tests need both `git` and `docker` matches, and the
+// explorer needs more than one 25-row page to exercise server paging.
+const SKILL_REGISTRY_FILLER = Array.from({ length: 30 }, (_, i) => ({
+  name: `fixture-skill-${String(i).padStart(2, "0")}`,
+  description: "Registry paging fixture.",
+  category: "productivity",
+  source: "fixture-pack",
+  tags: [],
+  platforms: ["linux", "macos", "windows"],
+  commands: [],
+  envVars: [],
+}));
+
 const SKILL_REGISTRY_CATALOG = [
   {
     name: "git-workflow",
@@ -28,14 +40,48 @@ const SKILL_REGISTRY_CATALOG = [
     commands: ["docker"],
     envVars: [],
   },
+  ...SKILL_REGISTRY_FILLER,
 ];
+
+// The skill named by `skillRegistryScanBlocked` carries a zero-width space,
+// which the supply-chain scan blocks; `skillRegistryScanVariant` changes its
+// text, and so its digest.
+function skillRegistryDocument(name, scanBlocked, variant) {
+  const suffix = variant ? ` (${variant})` : "";
+  const body = scanBlocked ? `Run the steps\u200b in order.${suffix}\n` : "";
+  return `---\nname: ${name}\ndescription: Mock registry skill ${name}.\n---\n\n# ${name}\n${body}`;
+}
 
 export function handleIntegrations(ctx) {
   const { method, url, parsedBody, res } = ctx;
   const mockBehavior = behavior();
 
   if (method === "GET" && /^\/skills\/catalog\.json\/?(?:\?.*)?$/.test(url)) {
+    if (mockBehavior.skillRegistryUnavailable === "true") {
+      json(res, 503, { success: false, error: "skill registry unavailable" });
+      return true;
+    }
     json(res, 200, SKILL_REGISTRY_CATALOG);
+    return true;
+  }
+
+  const skillDocument =
+    method === "GET" &&
+    url.match(/^\/skills\/([a-z0-9-]+)\/SKILL\.md(?:\?.*)?$/);
+  if (skillDocument) {
+    const name = skillDocument[1];
+    if (!SKILL_REGISTRY_CATALOG.some((entry) => entry.name === name)) {
+      json(res, 404, { success: false, error: "no such skill" });
+      return true;
+    }
+    res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
+    res.end(
+      skillRegistryDocument(
+        name,
+        mockBehavior.skillRegistryScanBlocked === name,
+        mockBehavior.skillRegistryScanVariant ?? "",
+      ),
+    );
     return true;
   }
 
@@ -180,14 +226,19 @@ export function handleIntegrations(ctx) {
       ? parsedBody.input
       : [parsedBody?.input ?? ""];
     // Honor the OpenAI `dimensions` parameter when present (the embeddings
-    // client sends it for `text-embedding-3-*` models). The save-time
-    // verification probe validates `vector.len() == configured dims`, so the
-    // returned vector must match the requested size; default to 4 for callers
-    // that don't request a specific size.
+    // client sends it for `text-embedding-3-*` models). Managed embeddings
+    // don't send that parameter, so tests can set `embeddingDimensions` to the
+    // managed model's fixed width. Keep the historical 4-wide default for
+    // callers without either value.
+    const configuredDims = Number(mockBehavior.embeddingDimensions);
+    const fallbackDims =
+      Number.isInteger(configuredDims) && configuredDims > 0
+        ? configuredDims
+        : 4;
     const requestedDims =
       Number.isInteger(parsedBody?.dimensions) && parsedBody.dimensions > 0
         ? parsedBody.dimensions
-        : 4;
+        : fallbackDims;
     const data = inputs.map((input, index) => {
       const text = String(input ?? "");
       // Keep the vector deterministic so callers that cache / compare
@@ -391,65 +442,28 @@ export function handleIntegrations(ctx) {
     method === "GET" &&
     /^\/agent-integrations\/composio\/tools\/?(\?.*)?$/.test(url)
   ) {
-    // Parse toolkits and tags from the query string.
+    // Parse toolkits from the query string.
     const qs = url.includes("?")
       ? new URLSearchParams(url.split("?")[1])
       : new URLSearchParams();
     const toolkitsParam = qs.get("toolkits") ?? "";
-    const tagsParam = qs.get("tags") ?? "";
     const requestedToolkits = toolkitsParam
       ? toolkitsParam
           .split(",")
           .map((t) => t.trim().toLowerCase())
           .filter(Boolean)
       : [];
-    const requestedTags = tagsParam
-      ? tagsParam
-          .split(",")
-          .map((t) => t.trim().toLowerCase())
-          .filter(Boolean)
-      : [];
-
-    // Allow tests to inject per-tag tool lists via
-    //   composioToolsByTag_<tag>  (e.g. "composioToolsByTag_stars")
-    // or a catch-all composioTools knob (array of tool objects).
-    // Falls back to [] when no knob is set.
-    let tools = [];
-
-    // Mirror the Rust gate: tags are only honoured when no toolkit filter is
-    // active or the toolkit list includes GitHub.
-    const hasGithubToolkit =
-      requestedToolkits.length === 0 || requestedToolkits.includes("github");
-    const effectiveTags = hasGithubToolkit ? requestedTags : [];
-
-    if (effectiveTags.length > 0) {
-      // OR semantics: union across all requested tags.
-      const seen = new Set();
-      for (const tag of effectiveTags) {
-        const knobKey = `composioToolsByTag_${tag}`;
-        const tagTools = parseBehaviorJson(knobKey, null);
-        if (Array.isArray(tagTools)) {
-          for (const t of tagTools) {
-            const name = t?.function?.name ?? t?.name ?? JSON.stringify(t);
-            if (!seen.has(name)) {
-              seen.add(name);
-              tools.push(t);
-            }
-          }
-        }
-      }
-    } else {
-      tools = parseBehaviorJson("composioTools", []);
-      // Filter by toolkits when requested and the knob returns a list with a
-      // "function.name" slug we can match (e.g. "GITHUB_*").
-      if (requestedToolkits.length > 0 && tools.length > 0) {
-        tools = tools.filter((t) => {
-          const name = (t?.function?.name ?? t?.name ?? "").toUpperCase();
-          return requestedToolkits.some((tk) =>
-            name.startsWith(tk.toUpperCase() + "_"),
-          );
-        });
-      }
+    // Allow tests to inject the tool list through the composioTools knob.
+    // Filter by toolkits when requested and the knob returns names such as
+    // "GITHUB_*".
+    let tools = parseBehaviorJson("composioTools", []);
+    if (requestedToolkits.length > 0 && tools.length > 0) {
+      tools = tools.filter((t) => {
+        const name = (t?.function?.name ?? t?.name ?? "").toUpperCase();
+        return requestedToolkits.some((tk) =>
+          name.startsWith(tk.toUpperCase() + "_"),
+        );
+      });
     }
 
     json(res, 200, { success: true, data: { tools } });
@@ -569,26 +583,6 @@ export function handleIntegrations(ctx) {
     return true;
   }
 
-  // ── Composio sync ──────────────────────────────────────────
-  if (
-    method === "POST" &&
-    /^\/agent-integrations\/composio\/sync\/?$/.test(url)
-  ) {
-    if (mockBehavior.composioSyncFails === "400") {
-      json(res, 400, { success: false, error: "Mock sync failure" });
-      return true;
-    }
-    if (
-      mockBehavior.composioSyncFails === "500" ||
-      mockBehavior.composioSyncFails === "1"
-    ) {
-      json(res, 500, { success: false, error: "Mock sync failure" });
-      return true;
-    }
-    json(res, 200, { success: true, data: { items_synced: 3 } });
-    return true;
-  }
-
   // ── Parallel search ────────────────────────────────────────
   if (
     method === "POST" &&
@@ -622,6 +616,185 @@ export function handleIntegrations(ctx) {
     return true;
   }
 
+  // ── Exa (managed) ──────────────────────────────────────────
+  // Mirrors backend `/agent-integrations/exa/*`: search takes
+  // `{objective, searchQueries}`; contents/answer/findSimilar proxy Exa's
+  // own REST bodies. `mockBehavior.exaInsufficientBalance = "1"` answers
+  // the backend's insufficient-credits 400.
+  if (method === "POST" && /^\/agent-integrations\/exa\//.test(url)) {
+    if (mockBehavior.exaInsufficientBalance === "1") {
+      json(res, 400, {
+        success: false,
+        error: "Insufficient balance",
+        errorCode: "USER_INSUFFICIENT_CREDITS",
+      });
+      return true;
+    }
+    if (/^\/agent-integrations\/exa\/search\/?$/.test(url)) {
+      const objective =
+        typeof parsedBody?.objective === "string"
+          ? parsedBody.objective.trim()
+          : "";
+      const queries = Array.isArray(parsedBody?.searchQueries)
+        ? parsedBody.searchQueries
+            .map((query) => String(query ?? "").trim())
+            .filter(Boolean)
+        : [];
+      if (!objective || queries.length === 0 || "mode" in (parsedBody ?? {})) {
+        json(res, 400, { success: false, error: "Invalid Exa search request" });
+        return true;
+      }
+      json(res, 200, {
+        success: true,
+        data: {
+          searchId: `exa-search-${queries.length}`,
+          results: queries.map((query, index) => ({
+            url: `https://exa.example.com/${index}`,
+            title: `Exa result for ${query}`,
+            publish_date: "2026-09-01",
+            excerpts: [`Objective: ${objective}; query: ${query}`],
+          })),
+          costUsd: 0.01,
+        },
+      });
+      return true;
+    }
+    if (/^\/agent-integrations\/exa\/contents\/?$/.test(url)) {
+      const urls = Array.isArray(parsedBody?.urls)
+        ? parsedBody.urls
+        : Array.isArray(parsedBody?.ids)
+          ? parsedBody.ids
+          : [];
+      json(res, 200, {
+        success: true,
+        data: {
+          requestId: "exa-contents",
+          results: urls.map((pageUrl) => ({
+            id: String(pageUrl),
+            url: String(pageUrl),
+            title: `Contents of ${pageUrl}`,
+            text: `Mock page text for ${pageUrl}`,
+          })),
+          costDollars: { total: 0.001 },
+        },
+      });
+      return true;
+    }
+    if (/^\/agent-integrations\/exa\/answer\/?$/.test(url)) {
+      const query = String(parsedBody?.query ?? "").trim();
+      json(res, 200, {
+        success: true,
+        data: {
+          requestId: "exa-answer",
+          answer: `Mock Exa answer for ${query}`,
+          citations: [
+            {
+              id: "c0",
+              url: "https://exa.example.com/answer",
+              title: "Exa source",
+            },
+          ],
+          costDollars: { total: 0.005 },
+        },
+      });
+      return true;
+    }
+    if (/^\/agent-integrations\/exa\/findSimilar\/?$/.test(url)) {
+      json(res, 200, {
+        success: true,
+        data: {
+          requestId: "exa-similar",
+          results: [
+            {
+              id: "s0",
+              url: "https://exa.example.com/similar",
+              title: "Similar page",
+            },
+          ],
+          costDollars: { total: 0.005 },
+        },
+      });
+      return true;
+    }
+  }
+
+  // ── Gemini grounded generate-content (managed) ─────────────
+  {
+    const match = url.match(
+      /^\/agent-integrations\/gemini\/models\/([^/?]+)\/generate-content\/?$/,
+    );
+    if (method === "POST" && match) {
+      const model = decodeURIComponent(match[1]);
+      const prompt = String(
+        parsedBody?.contents?.[0]?.parts?.[0]?.text ?? "",
+      ).trim();
+      json(res, 200, {
+        success: true,
+        data: {
+          modelVersion: model,
+          responseId: "gemini-mock",
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [{ text: `Mock grounded answer for ${prompt}` }],
+              },
+              groundingMetadata: {
+                webSearchQueries: [prompt],
+                groundingChunks: [
+                  {
+                    web: {
+                      uri: "https://gemini.example.com/source",
+                      title: "Grounding source",
+                    },
+                  },
+                ],
+                groundingSupports: [
+                  {
+                    segment: { startIndex: 0, endIndex: 10 },
+                    groundingChunkIndices: [0],
+                  },
+                ],
+              },
+            },
+          ],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 20 },
+          costUsd: 0.002,
+        },
+      });
+      return true;
+    }
+  }
+
+  // ── TinyFish (managed) ─────────────────────────────────────
+  if (
+    method === "POST" &&
+    /^\/agent-integrations\/tinyfish\/(search|fetch)\/?$/.test(url)
+  ) {
+    const isFetch = /\/fetch\/?$/.test(url);
+    json(res, 200, {
+      success: true,
+      data: isFetch
+        ? {
+            results: (parsedBody?.urls ?? []).map((pageUrl) => ({
+              url: String(pageUrl),
+              title: `Fetched ${pageUrl}`,
+              text: `Mock fetched text for ${pageUrl}`,
+            })),
+          }
+        : {
+            results: [
+              {
+                url: "https://tinyfish.example.com/0",
+                title: `TinyFish result for ${String(parsedBody?.query ?? "")}`,
+                snippet: "Mock TinyFish snippet",
+              },
+            ],
+          },
+    });
+    return true;
+  }
+
   // ── Composio user-scopes ───────────────────────────────────
   if (
     method === "GET" &&
@@ -644,28 +817,6 @@ export function handleIntegrations(ctx) {
     const pref = parsedBody ?? {};
     setMockBehavior("composioUserScopes", JSON.stringify(pref));
     json(res, 200, { success: true, data: pref });
-    return true;
-  }
-
-  // ── Apify ──────────────────────────────────────────────────
-  // Gap fill — minimal stubs for run polling.
-  const apifyMatch = url.match(
-    /^\/agent-integrations\/apify\/runs\/([^/?]+)(\/results)?\/?(\?.*)?$/,
-  );
-  if (apifyMatch && method === "GET") {
-    const [, runId, isResults] = apifyMatch;
-    if (isResults) {
-      json(res, 200, { success: true, data: { items: [] } });
-    } else {
-      json(res, 200, {
-        success: true,
-        data: {
-          id: runId,
-          status: "SUCCEEDED",
-          finishedAt: new Date().toISOString(),
-        },
-      });
-    }
     return true;
   }
 

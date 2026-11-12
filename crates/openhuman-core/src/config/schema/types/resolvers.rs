@@ -1,4 +1,4 @@
-//! Read-only resolvers on [`Config`]: memory-tree content root, per-workload
+//! Read-only resolvers on [`Config`]: files dir, per-workload
 //! local-model routing, and exact agent model pins.
 
 use std::path::PathBuf;
@@ -7,34 +7,49 @@ use super::output_language::output_language_directive;
 use crate::config::schema::Config;
 
 impl Config {
-    /// Resolve the root directory where chunk `.md` files are stored.
-    ///
-    /// Resolution order:
-    /// 1. `memory_tree.content_dir` if `Some`.
-    /// 2. Default: `<workspace_dir>/memory_tree/content/`.
-    ///
-    /// This is the only place in the codebase that should compute the content
-    /// root — all code that needs the path should call this method.
-    pub fn memory_tree_content_root(&self) -> PathBuf {
-        self.memory_tree
-            .content_dir
-            .clone()
-            .unwrap_or_else(|| self.workspace_dir.join("memory_tree").join("content"))
+    /// Locale for host-generated native-channel messages. Unsupported and
+    /// unset preferences fall back to English; model-output language and RPC
+    /// metadata are not consulted.
+    pub fn native_channel_locale(&self) -> &'static str {
+        crate::inference::failure_copy::supported_channel_locale(self.channels_locale.as_deref())
+            .unwrap_or("en")
+    }
+
+    /// Render a classified native-channel failure with this config's trusted
+    /// locale preference and the shared product chat-error catalog.
+    pub fn render_native_channel_failure(
+        &self,
+        fallback_message: &str,
+        copy_key: Option<&str>,
+        copy_params: Option<&serde_json::Value>,
+    ) -> String {
+        crate::inference::failure_copy::render_channel_failure(
+            self.native_channel_locale(),
+            fallback_message,
+            copy_key,
+            copy_params,
+        )
+    }
+
+    /// The folder agent deliverables are written to (#5505): the Settings
+    /// override when set, else `~/OpenHuman/projects/Files`. Every producer
+    /// and the boot migration read it through here.
+    pub fn files_dir(&self) -> PathBuf {
+        crate::config::resolve_files_dir(&self.files_dir_override)
     }
 
     /// Read the per-workload provider string and return the local model id
     /// when the workload is routed to Ollama.
     ///
     /// Recognised workload names:
-    /// `"chat"`, `"reasoning"`, `"agentic"`, `"coding"`, `"memory"`, `"embeddings"`,
-    /// `"heartbeat"`, `"learning"`, `"subconscious"`.
+    /// `"chat"`, `"reasoning"`, `"agentic"`, `"coding"`, `"vision"`, `"memory"`,
+    /// `"embeddings"`.
     ///
     /// Returns `None` when the provider isn't `"ollama:<model>"` (including
     /// when the field is unset, blank, `"cloud"`, or any other prefix).
     /// This is the single source of truth for "is this workload local?" —
-    /// callers MUST NOT consult the legacy `local_ai.usage.*` booleans or
-    /// `memory_tree.llm_backend`. Those fields are deprecated zombies kept
-    /// for migration only.
+    /// callers MUST NOT consult the legacy `local_ai.usage.*` booleans, which are
+    /// deprecated zombies kept for migration only.
     pub fn workload_local_model(&self, workload: &str) -> Option<String> {
         let raw = match workload {
             "chat" => self.chat_provider.as_deref(),
@@ -44,9 +59,6 @@ impl Config {
             "vision" => self.vision_provider.as_deref(),
             "memory" => self.memory_provider.as_deref(),
             "embeddings" => self.embeddings_provider.as_deref(),
-            "heartbeat" => self.heartbeat_provider.as_deref(),
-            "learning" => self.learning_provider.as_deref(),
-            "subconscious" => self.subconscious_provider.as_deref(),
             _ => None,
         }?;
         let trimmed = raw.trim();
@@ -76,8 +88,8 @@ impl Config {
     /// 1. `orchestrator.model` when resolving the front-line orchestrator.
     /// 2. `[teams.<agent_id>]` entries, with `lead_model` used for agents
     ///    that can delegate and `agent_model` used for leaf workers.
-    /// 3. Built-in aliases such as `[teams.research]` for `researcher` and
-    ///    `[teams.code]` for `code_executor`, matching the issue examples.
+    /// 3. `[teams.<name>]` for an `<name>_agent` id (e.g. `[teams.code]` for
+    ///    `code_agent`).
     ///
     /// Empty strings are ignored so partially-written configs fall back to
     /// the existing auto-routing path.
@@ -86,6 +98,14 @@ impl Config {
             model.map(str::trim).filter(|value| !value.is_empty())
         }
 
+        // A hosted profile's operator-fixed model outranks every per-agent pin.
+        if let Some(model) = self
+            .profile_providers
+            .as_ref()
+            .and_then(|binding| binding.chat_model())
+        {
+            return Some(model);
+        }
         let agent_id = agent_id.trim();
         if agent_id.is_empty() {
             return None;
@@ -105,28 +125,9 @@ impl Config {
             return Some(model);
         }
 
-        if let Some(stripped) = agent_id.strip_suffix("_agent") {
-            if let Some(model) = self
-                .teams
-                .get(stripped)
-                .and_then(|team| team.model_for_role(is_team_lead))
-            {
-                return Some(model);
-            }
-        }
-
-        let aliases: &[&str] = match agent_id {
-            "researcher" => &["research"],
-            "code_executor" => &["code"],
-            "tool_maker" | "tools_agent" => &["tools"],
-            "integrations_agent" => &["integrations"],
-            _ => &[],
-        };
-
-        aliases.iter().find_map(|alias| {
-            self.teams
-                .get(*alias)
-                .and_then(|team| team.model_for_role(is_team_lead))
-        })
+        let stripped = agent_id.strip_suffix("_agent")?;
+        self.teams
+            .get(stripped)
+            .and_then(|team| team.model_for_role(is_team_lead))
     }
 }

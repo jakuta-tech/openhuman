@@ -101,6 +101,24 @@ describe('tool labels: regressions', () => {
     expect(done('brave_image_search')).toBe('Searched images');
   });
 
+  it('covers the search role tools and provider answer tools', () => {
+    expect(done('web_answer_tool', { query: 'q' })).toBe('Asked the web');
+    expect(describeToolCall({ name: 'web_answer_tool', args: { query: 'q' } }).chip).toBe('q');
+    for (const name of ['web_answer_tool', 'gemini_agentic_search', 'exa_answer']) {
+      expect(describeToolCall({ name }).body, name).toBe('webSearch');
+    }
+    expect(done('gemini_deep_research')).toBe('Researched');
+    expect(describeToolCall({ name: 'gemini_deep_research' }).body).toBe('webSearch');
+    expect(done('web_contents_tool', { urls: ['https://a.dev/x', 'https://b.dev'] })).toBe(
+      'Read pages'
+    );
+    expect(
+      describeToolCall({ name: 'web_contents_tool', args: { urls: ['https://a.dev/x'] } }).body
+    ).toBe('webFetch');
+    // Parallel was removed from the core, but old transcripts still render.
+    expect(done('parallel_research')).toBe('Researched');
+  });
+
   it('describes the deferred-tool bridge as the tool it calls', () => {
     expect(done('tool_call', { name: 'SLACK_SEND_MESSAGE', arguments: {} })).toBe('Used Slack');
     expect(done('tool_call', { name: 'file_read', arguments: { path: '/a/b/c/d.ts' } })).toBe(
@@ -115,9 +133,28 @@ describe('tool labels: regressions', () => {
     expect(done('browser', { action: 'click', selector: '#go' })).toBe('Clicked');
   });
 
+  it('labels the memory v2 actions and chips their main argument', () => {
+    const recall = describeToolCall({
+      name: 'memory',
+      args: { action: 'recall', question: 'what do I prefer?' },
+    });
+    expect(recall.chip).toBe('what do I prefer?');
+    expect(done('memory', { action: 'fetch', query: 'tea' })).toBe(done('memory_hybrid_search'));
+    expect(describeToolCall({ name: 'memory', args: { action: 'fetch', query: 'tea' } }).chip).toBe(
+      'tea'
+    );
+    expect(done('memory', { action: 'learn', text: 'likes tea' })).toBe('Saved to memory');
+    expect(
+      describeToolCall({ name: 'memory', args: { action: 'learn', text: 'likes tea' } }).chip
+    ).toBe('likes tea');
+  });
+
   it('labels named agents and delegations by what they do', () => {
-    expect(done('subagent:researcher')).toBe('Researched');
+    expect(done('subagent:planner')).toBe('Planned next steps');
     expect(done('spawn_subagent', { agent_id: 'critic' })).toBe('Reviewed the work');
+    // Older transcripts still contain the former async spawn name.
+    expect(done('spawn_async_subagent', { agent_id: 'critic' })).toBe('Reviewed the work');
+    expect(done('delegate_coder')).toBe('Delegated task');
     expect(done('delegate_gmail')).toBe('Used Gmail');
     expect(active('run_code')).toBe('Running code');
     expect(

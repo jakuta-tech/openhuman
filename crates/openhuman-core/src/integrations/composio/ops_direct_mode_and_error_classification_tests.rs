@@ -1,11 +1,12 @@
 use super::*;
+use crate::core::runtime::DispatchCtx;
 
 #[tokio::test]
 async fn composio_set_api_key_rejects_invalid_direct_key_before_persisting() {
     use crate::config::TEST_ENV_LOCK;
-    use crate::security::credentials::get_composio_api_key;
+    use crate::integrations::composio::get_composio_api_key;
 
-    let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env_guard = TEST_ENV_LOCK.lock().await;
     let app = Router::new().route(
         "/connected_accounts",
         get(|| async {
@@ -23,15 +24,22 @@ async fn composio_set_api_key_rejects_invalid_direct_key_before_persisting() {
     let config = direct_mode_no_key_config(&tmp);
     let _auth_guard = DirectAuthFailureGuard::new("ck_invalid_direct");
 
-    let err = composio_set_api_key(&config, "ck_invalid_direct", false)
-        .await
-        .expect_err("invalid direct-mode key must be rejected before persistence");
+    let err = composio_set_api_key(
+        &DispatchCtx::process_default(),
+        &config,
+        "ck_invalid_direct",
+        false,
+    )
+    .await
+    .expect_err("invalid direct-mode key must be rejected before persistence");
     assert!(
         err.contains("Invalid Composio API key"),
         "unexpected error: {err}"
     );
     assert_eq!(
-        get_composio_api_key(&config).expect("read composio key after failed save"),
+        get_composio_api_key(&config)
+            .await
+            .expect("read composio key after failed save"),
         None,
         "invalid key must not be stored"
     );
@@ -40,10 +48,10 @@ async fn composio_set_api_key_rejects_invalid_direct_key_before_persisting() {
 #[tokio::test]
 async fn composio_set_api_key_validates_candidate_key_even_when_stored_key_exists() {
     use crate::config::TEST_ENV_LOCK;
-    use crate::security::credentials::{get_composio_api_key, store_composio_api_key};
+    use crate::integrations::composio::{get_composio_api_key, store_composio_api_key};
     use std::sync::{Arc, Mutex};
 
-    let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env_guard = TEST_ENV_LOCK.lock().await;
     let seen_keys = Arc::new(Mutex::new(Vec::<String>::new()));
     let app = Router::new()
         .route(
@@ -79,15 +87,22 @@ async fn composio_set_api_key_validates_candidate_key_even_when_stored_key_exist
         .expect("seed old stored composio key");
     let _new_key_guard = DirectAuthFailureGuard::new("ck_new_invalid");
 
-    let err = composio_set_api_key(&config, "ck_new_invalid", false)
-        .await
-        .expect_err("candidate invalid key must be rejected even if old stored key is valid");
+    let err = composio_set_api_key(
+        &DispatchCtx::process_default(),
+        &config,
+        "ck_new_invalid",
+        false,
+    )
+    .await
+    .expect_err("candidate invalid key must be rejected even if old stored key is valid");
     assert!(
         err.contains("Invalid Composio API key"),
         "unexpected error: {err}"
     );
     assert_eq!(
-        get_composio_api_key(&config).expect("read composio key after failed replacement"),
+        get_composio_api_key(&config)
+            .await
+            .expect("read composio key after failed replacement"),
         Some("ck_old_valid".to_string()),
         "failed replacement must leave the old stored key intact"
     );
@@ -122,8 +137,14 @@ async fn composio_set_api_key_validates_candidate_key_even_when_stored_key_exist
 async fn composio_list_tools_in_direct_mode_does_not_fall_back_to_backend() {
     let _serialised = module_guard().await;
     let tmp = tempfile::tempdir().unwrap();
-    let config = direct_mode_config(&tmp);
-    let result = composio_list_tools(&config, None, None).await;
+    let config = direct_mode_config(&tmp).await;
+    let result = composio_list_tools(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        None,
+        None,
+    )
+    .await;
     match result {
         Ok(outcome) => {
             // If the prefetch returns empty connections (test env may
@@ -165,10 +186,15 @@ async fn composio_authorize_routes_through_direct_mode() {
     // important thing is that backend mode would have produced
     // "composio unavailable / no backend session" instead.
     let tmp = tempfile::tempdir().unwrap();
-    let config = direct_mode_config(&tmp);
-    let err = composio_authorize(&config, "gmail", None)
-        .await
-        .unwrap_err();
+    let config = direct_mode_config(&tmp).await;
+    let err = composio_authorize(
+        &crate::core::runtime::DispatchCtx::host_default(),
+        &config,
+        "gmail",
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(
         !err.contains("no backend session"),
         "direct mode must not surface backend-auth errors, got: {err}"
@@ -189,7 +215,7 @@ async fn composio_execute_routes_through_direct_mode() {
     // surfaces because the live HTTP call cannot succeed against a
     // test key.
     let tmp = tempfile::tempdir().unwrap();
-    let config = direct_mode_config(&tmp);
+    let config = direct_mode_config(&tmp).await;
     let err = composio_execute(&config, "GMAIL_SEND_EMAIL", None, None)
         .await
         .unwrap_err();
@@ -201,6 +227,22 @@ async fn composio_execute_routes_through_direct_mode() {
         err.to_lowercase().contains("composio"),
         "error must carry the composio prefix, got: {err}"
     );
+}
+
+#[cfg(feature = "crash-reporting")]
+#[tokio::test]
+async fn a_cached_module_load_failure_is_not_reported_per_call() {
+    // TAURI-RUST-117K: the connector module failed to load, the failure is
+    // cached, and every composio call returned it. The load was reported once
+    // at resolution; the op-layer funnel must not report it again per call.
+    let error = "module 'tinyconnectors' could not be loaded from the installer bundle: \
+                 module `windows-2022-x86_64` refused: module directory is writable by \
+                 another user. Restart the app after repairing the installation. This is \
+                 terminal for the running process; restart the app to try again";
+    let events = sentry::test::with_captured_events(|| {
+        report_composio_op_error("list_connections", error);
+    });
+    assert!(events.is_empty(), "{events:?}");
 }
 
 // ── classify_composio_failure_tag ──────────────────────────────
@@ -216,8 +258,8 @@ async fn composio_execute_routes_through_direct_mode() {
 // Any drift between the helper's classification and the filter's
 // expectations would silently re-open the leak path.
 
-#[test]
-fn composio_failure_tag_is_non_2xx_for_backend_returned_502() {
+#[tokio::test]
+async fn composio_failure_tag_is_non_2xx_for_backend_returned_502() {
     // OPENHUMAN-TAURI-35 / -2H wire shape — the dominant leak. The
     // integrations layer renders this on a 5xx response; composio's op
     // layer wraps the chain and re-reports under `domain=composio`. The
@@ -229,8 +271,8 @@ fn composio_failure_tag_is_non_2xx_for_backend_returned_502() {
     assert_eq!(classify_composio_failure_tag(rendered), "non_2xx");
 }
 
-#[test]
-fn composio_failure_tag_is_non_2xx_for_envelope_error() {
+#[tokio::test]
+async fn composio_failure_tag_is_non_2xx_for_envelope_error() {
     // Envelope errors don't carry a transport phrase or "error sending
     // request" anchor; default to non_2xx.
     let rendered = "Backend error for POST https://api.tinyhumans.ai/x: \
@@ -238,8 +280,8 @@ fn composio_failure_tag_is_non_2xx_for_envelope_error() {
     assert_eq!(classify_composio_failure_tag(rendered), "non_2xx");
 }
 
-#[test]
-fn composio_failure_tag_is_transport_for_operation_timed_out() {
+#[tokio::test]
+async fn composio_failure_tag_is_transport_for_operation_timed_out() {
     // OPENHUMAN-TAURI-18 / -G shape — `composio/execute` reqwest chain
     // surfaces `operation timed out` (one of `TRANSIENT_TRANSPORT_PHRASES`).
     // Tag MUST be `transport` so the filter's transport-phrase branch fires
@@ -252,8 +294,8 @@ fn composio_failure_tag_is_transport_for_operation_timed_out() {
     assert_eq!(classify_composio_failure_tag(rendered), "transport");
 }
 
-#[test]
-fn composio_failure_tag_is_transport_for_dns_and_tls_phrases() {
+#[tokio::test]
+async fn composio_failure_tag_is_transport_for_dns_and_tls_phrases() {
     for raw in [
         "POST /v1/foo failed: error sending request for url (https://api.example.com/x)",
         "GET /agent-integrations/composio/connections failed: tls handshake eof",
@@ -268,8 +310,8 @@ fn composio_failure_tag_is_transport_for_dns_and_tls_phrases() {
     }
 }
 
-#[test]
-fn composio_failure_tag_does_not_misclassify_unrelated_messages() {
+#[tokio::test]
+async fn composio_failure_tag_does_not_misclassify_unrelated_messages() {
     // A bare error string with no transport / "error sending request"
     // anchor must default to non_2xx — the safe choice for the dominant
     // leak shape.
@@ -295,8 +337,8 @@ fn composio_failure_tag_does_not_misclassify_unrelated_messages() {
 // from a 401, and the dominant leak shape (OPENHUMAN-TAURI-35 / -2H)
 // re-opens.
 
-#[test]
-fn extract_backend_returned_status_parses_three_digit_status() {
+#[tokio::test]
+async fn extract_backend_returned_status_parses_three_digit_status() {
     let rendered = "Backend returned 502 Bad Gateway for POST \
                     https://api.tinyhumans.ai/agent-integrations/composio/connections: \
                     upstream temporarily unavailable";
@@ -306,15 +348,15 @@ fn extract_backend_returned_status_parses_three_digit_status() {
     );
 }
 
-#[test]
-fn extract_backend_returned_status_returns_none_when_no_status() {
+#[tokio::test]
+async fn extract_backend_returned_status_returns_none_when_no_status() {
     // Envelope-style error with no HTTP status digits after the anchor.
     let rendered = "Backend returned bad gateway (envelope-only error)";
     assert_eq!(extract_backend_returned_status(rendered), None);
 }
 
-#[test]
-fn extract_backend_returned_status_handles_mixed_case() {
+#[tokio::test]
+async fn extract_backend_returned_status_handles_mixed_case() {
     // Some renders upper-case the prefix; the helper lowercases before
     // matching so both shapes resolve to the same status string.
     let rendered = "BACKEND RETURNED 429 Too Many Requests for GET \
@@ -334,8 +376,8 @@ fn extract_backend_returned_status_handles_mixed_case() {
 // the composio crate to catch it. These guards make the link explicit.
 
 #[cfg(feature = "crash-reporting")]
-#[test]
-fn composio_domain_502_is_dropped_by_before_send() {
+#[tokio::test]
+async fn composio_domain_502_is_dropped_by_before_send() {
     let mut event = sentry::protocol::Event::default();
     let mut tags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     tags.insert("domain".into(), "composio".into());
@@ -349,8 +391,8 @@ fn composio_domain_502_is_dropped_by_before_send() {
 }
 
 #[cfg(feature = "crash-reporting")]
-#[test]
-fn composio_transport_timeout_is_dropped_by_before_send() {
+#[tokio::test]
+async fn composio_transport_timeout_is_dropped_by_before_send() {
     let mut event = sentry::protocol::Event::default();
     let mut tags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     tags.insert("domain".into(), "composio".into());
@@ -376,8 +418,8 @@ fn composio_transport_timeout_is_dropped_by_before_send() {
 // `core::observability` these tests prove the leak path (~15.7 k events
 // in ~22h before #1166) is closed end-to-end.
 
-#[test]
-fn composio_direct_invalid_api_key_classifies_as_provider_user_state() {
+#[tokio::test]
+async fn composio_direct_invalid_api_key_classifies_as_provider_user_state() {
     // The verbatim Sentry TAURI-RUST-X9 wire shape — emitted by
     // `ops.rs::composio_list_connections` direct branch via the
     // `report_composio_op_error` hook restored in #1166. Routing this
@@ -394,8 +436,8 @@ fn composio_direct_invalid_api_key_classifies_as_provider_user_state() {
     );
 }
 
-#[test]
-fn composio_direct_invalid_api_key_failure_tag_is_non_2xx() {
+#[tokio::test]
+async fn composio_direct_invalid_api_key_failure_tag_is_non_2xx() {
     // Belt-and-suspenders: even if `expected_error_kind` ever stops
     // matching the body (regression in the classifier arm), the
     // failure tag must STILL be `non_2xx`. Combined with the
@@ -414,8 +456,8 @@ fn composio_direct_invalid_api_key_failure_tag_is_non_2xx() {
     );
 }
 
-#[test]
-fn composio_direct_invalid_api_key_extract_status_returns_none() {
+#[tokio::test]
+async fn composio_direct_invalid_api_key_extract_status_returns_none() {
     // Pins the contract: `extract_backend_returned_status` only parses
     // the integrations-layer `Backend returned <status>` rendering, NOT
     // the direct-mode `HTTP 401` shape. The direct-mode arm relies on
@@ -433,8 +475,8 @@ fn composio_direct_invalid_api_key_extract_status_returns_none() {
     );
 }
 
-#[test]
-fn composio_direct_500_does_not_demote() {
+#[tokio::test]
+async fn composio_direct_500_does_not_demote() {
     // Discrimination test from the composio side — a real bug shape
     // (500 with no auth body) MUST escape the classifier and reach
     // `report_error_message`. Without this guard the matcher in
@@ -451,16 +493,18 @@ fn composio_direct_500_does_not_demote() {
 
 #[tokio::test]
 async fn enrich_does_nothing_when_no_cached_identities() {
-    // `enrich_connections_with_identity` reads through the bound memory
-    // driver now (`identity_store::load_connected_identities`), not the
-    // deleted engine's process-global client — see the module doc comment on
-    // `identity_store`. The fresh temp workspace has no profiles, so it
-    // returns `Vec::new()` and the connection is returned unchanged.
+    // `enrich_connections_with_identity` reads the workspace identities file
+    // (`identity_store::load_connected_identities`). The fresh temp workspace
+    // has none, so the connection is returned unchanged.
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(&tmp);
-    crate::memory::test_support::install_memory_driver_for_test(&config);
     let resp = make_connections_response(&[("c1", "gmail", "ACTIVE")]);
-    let enriched = enrich_connections_with_identity(&config, resp).await;
+    let enriched = enrich_connections_with_identity(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        resp,
+    )
+    .await;
     assert_eq!(enriched.connections.len(), 1);
     assert!(enriched.connections[0].account_email.is_none());
     assert!(enriched.connections[0].workspace.is_none());
@@ -473,12 +517,16 @@ async fn enrich_skips_connection_already_having_identity() {
     // enricher must NOT overwrite it with a potentially stale cached value.
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(&tmp);
-    crate::memory::test_support::install_memory_driver_for_test(&config);
 
     let mut resp = make_connections_response(&[("c-preloaded", "gmail", "ACTIVE")]);
     resp.connections[0].account_email = Some("preloaded@example.com".to_string());
 
-    let enriched = enrich_connections_with_identity(&config, resp).await;
+    let enriched = enrich_connections_with_identity(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        resp,
+    )
+    .await;
     assert_eq!(
         enriched.connections[0].account_email.as_deref(),
         Some("preloaded@example.com"),
@@ -490,15 +538,15 @@ async fn enrich_skips_connection_already_having_identity() {
 async fn enrich_leaves_unmatched_connection_unchanged() {
     // Connection whose id has no cached profile row is returned with all
     // identity fields as None — the UI falls back to "toolkit · connection_id".
+    use crate::integrations::composio::contract::ProviderUserProfile;
     use crate::integrations::composio::identity_store::persist_provider_profile;
-    use tinymemory_api::composio::ProviderUserProfile;
 
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(&tmp);
-    crate::memory::test_support::install_memory_driver_for_test(&config);
 
     // Persist a profile for a DIFFERENT connection id.
     persist_provider_profile(
+        &crate::core::runtime::DispatchCtx::ambient(),
         &config,
         &ProviderUserProfile {
             toolkit: "gmail".to_string(),
@@ -511,63 +559,17 @@ async fn enrich_leaves_unmatched_connection_unchanged() {
     .expect("persist provider profile");
 
     let resp = make_connections_response(&[("no-profile-conn", "gmail", "ACTIVE")]);
-    let enriched = enrich_connections_with_identity(&config, resp).await;
+    let enriched = enrich_connections_with_identity(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        resp,
+    )
+    .await;
 
     assert!(
         enriched.connections[0].account_email.is_none(),
         "connection with no cached profile must remain unenriched"
     );
-}
-
-/// A run that wrote nothing because the day's request budget was spent must
-/// say so: the UI shows "Up to date" for a zero count, and a spent budget is
-/// the opposite. The note rides after the count so the parse contract holds,
-/// and a blank note is no separator with nothing behind it.
-#[test]
-fn completed_detail_carries_the_module_note_after_the_count() {
-    let re = regex::Regex::new(r"(?i)ingested\s+(\d+)\s+item").expect("ui parse regex");
-    let detail = crate::integrations::composio::ops::completed_sync_detail(
-        0,
-        true,
-        Some("today's provider request budget is spent"),
-    );
-    let caps = re.captures(&detail).expect("detail still parses");
-    assert_eq!(&caps[1], "0");
-    assert!(
-        detail.ends_with("; today's provider request budget is spent"),
-        "{detail}"
-    );
-    let bare = crate::integrations::composio::ops::completed_sync_detail(3, false, Some("   "));
-    assert_eq!(bare, "ingested 3 item(s)");
-}
-
-/// The per-source depth cap is matched the way the engine keys the rows and a
-/// zero reads as "no cap": the settings field stores unlimited as empty, and a
-/// zero typed by hand must not ask for mail newer than today.
-#[test]
-fn source_depth_matches_the_row_and_treats_zero_as_unbounded() {
-    use crate::integrations::composio::ops::pick_source_sync_depth_days;
-    let rows = [
-        (Some("gmail"), Some("conn-1"), Some(30)),
-        (Some("gmail"), Some("conn-2"), Some(0)),
-        (Some("notion"), Some("conn-3"), Some(14)),
-        (Some("gmail"), None, Some(7)),
-    ];
-    assert_eq!(
-        pick_source_sync_depth_days(rows, "gmail", "conn-1"),
-        Some(30)
-    );
-    assert_eq!(
-        pick_source_sync_depth_days(rows, " GMAIL ", "conn-1 "),
-        Some(30)
-    );
-    assert_eq!(pick_source_sync_depth_days(rows, "gmail", "conn-2"), None);
-    assert_eq!(pick_source_sync_depth_days(rows, "gmail", "conn-9"), None);
-    assert_eq!(
-        pick_source_sync_depth_days(rows, "notion", "conn-3"),
-        Some(14)
-    );
-    assert_eq!(pick_source_sync_depth_days([], "gmail", "conn-1"), None);
 }
 
 // ── Backend mode with no session yet (#6176) ──────────────────────────
@@ -576,76 +578,78 @@ fn source_depth_matches_the_row_and_treats_zero_as_unbounded() {
 // with no app-session JWT is the fresh-install / signed-out state.
 // `composio_list_connections` must answer with an empty list instead of
 // letting the connector module report "loaded without a connector route",
-// which the boot-time memory-source reconcile and the 60 s periodic tick
-// would otherwise turn into an error-level report and a Sentry event.
+// which callers would otherwise turn into an error-level report and a Sentry
+// event.
 
 /// Store an app-session JWT in the auth store `config` points at, the same
 /// way `client_tests::config_with_session_token` does.
-fn store_test_session_token(config: &crate::config::Config) {
-    crate::security::credentials::AuthService::from_config(config)
+async fn store_test_session_token(config: &crate::config::Config) {
+    crate::credentials::AuthService::from_config(config)
         .store_provider_token(
-            crate::security::credentials::APP_SESSION_PROVIDER,
-            crate::security::credentials::DEFAULT_AUTH_PROFILE_NAME,
+            crate::credentials::APP_SESSION_PROVIDER,
+            crate::credentials::DEFAULT_AUTH_PROFILE_NAME,
             "test-session-token",
             std::collections::HashMap::new(),
             true,
         )
+        .await
         .expect("store test session token");
 }
 
-#[test]
-fn backend_mode_without_session_is_true_for_default_mode_and_no_session() {
+#[tokio::test]
+async fn backend_mode_without_session_is_true_for_default_mode_and_no_session() {
     let tmp = tempfile::tempdir().unwrap();
     // `Config::default()` leaves `composio.mode` empty, which is backend mode.
     let config = test_config(&tmp);
-    assert!(backend_mode_without_session(&config));
+    assert!(backend_mode_without_session(&config).await);
 }
 
-#[test]
-fn backend_mode_without_session_is_true_for_explicit_backend_mode() {
+#[tokio::test]
+async fn backend_mode_without_session_is_true_for_explicit_backend_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = test_config(&tmp);
     config.composio.mode = crate::config::schema::COMPOSIO_MODE_BACKEND.into();
-    assert!(backend_mode_without_session(&config));
+    assert!(backend_mode_without_session(&config).await);
 }
 
-#[test]
-fn backend_mode_without_session_is_false_in_direct_mode() {
+#[tokio::test]
+async fn backend_mode_without_session_is_false_in_direct_mode() {
     let tmp = tempfile::tempdir().unwrap();
     // Direct mode never needs a session; its no-key state belongs to
     // `direct_mode_without_key`, and the two guards must not overlap.
     let config = direct_mode_no_key_config(&tmp);
-    assert!(!backend_mode_without_session(&config));
+    assert!(!backend_mode_without_session(&config).await);
 }
 
-#[test]
-fn backend_mode_without_session_is_false_once_signed_in() {
+#[tokio::test]
+async fn backend_mode_without_session_is_false_once_signed_in() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(&tmp);
-    store_test_session_token(&config);
+    store_test_session_token(&config).await;
     // A stored session means the module gets a proxy route — the guard must
     // step aside, or a signed-in user would see a silent empty list.
-    assert!(!backend_mode_without_session(&config));
+    assert!(!backend_mode_without_session(&config).await);
 }
 
-#[test]
-fn backend_mode_treats_local_offline_credential_as_no_backend_session() {
+#[tokio::test]
+async fn backend_mode_treats_local_offline_credential_as_no_backend_session() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(&tmp);
-    crate::security::credentials::AuthService::from_config(&config)
+    crate::credentials::AuthService::from_config(&config)
         .store_provider_token(
-            crate::security::credentials::APP_SESSION_PROVIDER,
-            crate::security::credentials::DEFAULT_AUTH_PROFILE_NAME,
+            crate::credentials::APP_SESSION_PROVIDER,
+            crate::credentials::DEFAULT_AUTH_PROFILE_NAME,
             "header.payload.local",
             std::collections::HashMap::new(),
             true,
         )
+        .await
         .expect("store offline credential");
-    assert!(backend_mode_without_session(&config));
+    assert!(backend_mode_without_session(&config).await);
 }
 
-#[test]
-fn backend_mode_without_session_is_false_when_the_session_store_is_unreadable() {
+#[tokio::test]
+async fn backend_mode_without_session_is_false_when_the_session_store_is_unreadable() {
     let tmp = tempfile::tempdir().unwrap();
     // The auth-profile store lives in `config_path.parent()`
     // (`state_dir_from_config`); a regular file there makes it fail to load,
@@ -657,5 +661,46 @@ fn backend_mode_without_session_is_false_when_the_session_store_is_unreadable() 
     std::fs::write(&occupied, "not a directory").unwrap();
     let mut config = test_config(&tmp);
     config.config_path = occupied.join("config.toml");
-    assert!(!backend_mode_without_session(&config));
+    assert!(!backend_mode_without_session(&config).await);
+}
+
+// ── composio_op_report_message ─────────────────────────────────
+//
+// TAURI-RUST-116R (#8509): the op reporter sends a static message to Sentry,
+// so the direct-key backoff must be recognised BEFORE the message is replaced,
+// or the `ProviderUserState` demotion never sees it (CodeRabbit on #8516).
+
+#[test]
+fn the_direct_key_backoff_is_reported_as_its_demoted_anchor() {
+    let backoff = crate::integrations::composio::direct_auth::invalid_api_key_backoff_message(3);
+    for rendered in [backoff.clone(), format!("[composio-direct] {backoff}")] {
+        let message = composio_op_report_message(&rendered);
+        assert_eq!(
+            message,
+            crate::integrations::composio::direct_auth::COMPOSIO_DIRECT_KEY_BACKOFF_ANCHOR
+        );
+        assert_eq!(
+            crate::core::observability::expected_error_kind(message),
+            Some(crate::core::observability::ExpectedErrorKind::ProviderUserState),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
+fn other_op_errors_keep_the_static_message_and_stay_reportable() {
+    for rendered in [
+        "Backend returned 502 Bad Gateway for GET https://example.test/x: upstream down",
+        "Backend returned 502 Bad Gateway: Direct-mode Composio API key was rejected earlier",
+        "HTTP 401: Invalid API key",
+        "error sending request: operation timed out",
+    ] {
+        let message = composio_op_report_message(rendered);
+        assert_eq!(message, "connector operation failed", "{rendered}");
+        assert_eq!(
+            crate::core::observability::expected_error_kind(message),
+            None,
+            "{rendered}"
+        );
+    }
 }

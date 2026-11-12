@@ -125,17 +125,15 @@ async function waitForCore(
  */
 async function isDaemonRunning(callRpc: BootCheckTransport['callRpc']): Promise<boolean> {
   try {
-    const result = await callRpc<{ installed?: boolean; running?: boolean }>(
-      'openhuman.service_status',
-      {}
-    );
-    const detected = Boolean(result?.installed || result?.running);
-    log(
-      '[boot-check] service_status detected=%s installed=%s running=%s',
-      detected,
-      result?.installed,
-      result?.running
-    );
+    // The core sends a `ServiceStatus` ({ state, unit_path, label, details }),
+    // inside a `{ result, logs }` envelope whenever the op logs (it does today).
+    const response = await callRpc<unknown>('openhuman.service_status', {});
+    const status = (response as { result?: unknown } | null)?.result ?? response;
+    const state = (status as { state?: unknown } | null)?.state;
+    // Only `Running` proves a daemon: macOS and Linux report `Stopped` for a
+    // unit that was never installed (platform/service/{macos,linux}.rs#status).
+    const detected = state === 'Running';
+    log('[boot-check] service_status detected=%s state=%o', detected, state);
     return detected;
   } catch (err) {
     log('[boot-check] service_status error (non-fatal): %o', err);
@@ -156,12 +154,12 @@ type VersionCheckResult = 'match' | 'outdated' | 'noVersionMethod' | 'unreachabl
 
 async function checkVersion(callRpc: BootCheckTransport['callRpc']): Promise<VersionCheckResult> {
   try {
-    // `openhuman.update_version` is wrapped by RpcOutcome::single_log
+    // `openhuman.update_version` is wrapped by Outcome::single_log
     // (see crates/openhuman-core/src/platform/update/ops.rs + crates/openhuman-rpc/src/mod.rs::into_cli_compatible_json):
     // when logs are present the response shape is `{ result: VersionInfo, logs }`,
     // and VersionInfo is `{ version, target_triple, asset_prefix }`. Earlier
     // attempts read `result.version_info.version` (no such field) and then
-    // `result.version` (skipped the RpcOutcome `result` wrapper) — both
+    // `result.version` (skipped the Outcome `result` wrapper) — both
     // yielded '' and pinned every boot to "outdated local".
     const response = await callRpc<{ result?: { version?: string } }>(
       'openhuman.update_version',

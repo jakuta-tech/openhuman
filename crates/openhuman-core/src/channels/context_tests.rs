@@ -1,7 +1,6 @@
 use super::*;
-use crate::channels::traits;
 use async_trait::async_trait;
-use tinymemory_api::types::{MemoryCategory, MemoryEntry};
+use tinychannels_bus as traits;
 use tinytools::{Tool, ToolResult};
 
 struct DummyTool;
@@ -25,54 +24,40 @@ impl Tool for DummyTool {
     }
 }
 
-fn memory_entry(key: &str, content: &str, score: Option<f64>) -> MemoryEntry {
-    MemoryEntry {
-        id: key.into(),
-        key: key.into(),
-        content: content.into(),
-        namespace: None,
-        category: MemoryCategory::Conversation,
-        timestamp: "now".into(),
-        session_id: None,
-        score,
-        taint: Default::default(),
-    }
-}
-
 fn runtime_context() -> ChannelRuntimeContext {
     let model: Arc<dyn tinyinference_llm::model::ChatModel<()>> =
         Arc::new(tinyagents_harness::testkit::ScriptedModel::replies(vec![
             "ok",
         ]));
     ChannelRuntimeContext {
+        relay_thread: None,
         channels_by_name: Arc::new(HashMap::new()),
+        module_objects: Arc::new(HashMap::new()),
         turn_model_source: Some(crate::agent::tinyagents::TurnModelSource::from_model(model)),
         default_provider: Arc::new("default".into()),
-        memory: crate::memory::guard::in_memory::FixedRecallProvider::guarded(Vec::new()),
         tools_registry: Arc::new(vec![Box::new(DummyTool) as Box<dyn Tool>]),
         system_prompt: crate::channels::ChannelSystemPrompt::fixed("prompt"),
         model: Arc::new("model".into()),
         temperature: 0.0,
-        auto_save_memory: false,
         max_tool_iterations: 1,
-        min_relevance_score: 0.4,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         turn_model_source_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_url: None,
         inference_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-        provider_runtime_options: crate::inference::provider::ProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(PathBuf::from("/tmp")),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         multimodal: crate::config::MultimodalConfig::default(),
         multimodal_files: crate::config::MultimodalFileConfig::default(),
         config: None,
+        core: None,
     }
 }
 
 fn channel_message(channel: &str) -> traits::ChannelMessage {
     traits::ChannelMessage {
+        reply_to_id: None,
+        topic_id: None,
         channel: channel.into(),
         sender: "alice".into(),
         content: "hello".into(),
@@ -80,20 +65,16 @@ fn channel_message(channel: &str) -> traits::ChannelMessage {
         reply_target: "reply".into(),
         thread_ts: Some("thread-1".into()),
         timestamp: 0,
+        sender_name: None,
     }
 }
 
 #[test]
 fn timeout_and_history_keys_respect_channel_rules() {
-    assert_eq!(
-        effective_channel_message_timeout_secs(10),
-        MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
-    );
-    assert_eq!(effective_channel_message_timeout_secs(120), 120);
+    const { assert!(CHANNEL_MESSAGE_TIMEOUT_SECS >= MIN_CHANNEL_MESSAGE_TIMEOUT_SECS) };
 
     let telegram = channel_message("telegram");
     let discord = channel_message("discord");
-    assert_eq!(conversation_memory_key(&telegram), "telegram_alice_m1");
     assert_eq!(conversation_history_key(&telegram), "telegram_alice_reply");
     assert_eq!(
         conversation_history_key(&discord),
@@ -101,85 +82,18 @@ fn timeout_and_history_keys_respect_channel_rules() {
     );
 }
 
-#[test]
-fn clear_and_compact_sender_history_update_cached_messages() {
+#[tokio::test]
+async fn overflow_detection_covers_edge_cases() {
     let ctx = runtime_context();
-    let sender = "discord_alice_reply_thread:thread-1";
-    let mut history = Vec::new();
-    history.push(crate::agent::messages::ChatMessage::user("short"));
-    history.extend(
-        (0..20).map(|idx| crate::agent::messages::ChatMessage::assistant("x".repeat(700 + idx))),
+    assert!(is_context_window_overflow_error(
+        &ctx,
+        &anyhow::anyhow!("Maximum context length exceeded")
+    )
+    .await
+    .unwrap());
+    assert!(
+        !is_context_window_overflow_error(&ctx, &anyhow::anyhow!("network timeout"))
+            .await
+            .unwrap()
     );
-    ctx.conversation_histories
-        .lock()
-        .unwrap()
-        .insert(sender.into(), history);
-
-    assert!(compact_sender_history(&ctx, sender));
-    {
-        let compacted = ctx.conversation_histories.lock().unwrap();
-        let compacted = compacted.get(sender).unwrap();
-        assert_eq!(compacted.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-        assert!(compacted.iter().all(|msg| {
-            msg.content.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
-        }));
-    }
-
-    clear_sender_history(&ctx, sender);
-    assert!(!ctx
-        .conversation_histories
-        .lock()
-        .unwrap()
-        .contains_key(sender));
-}
-
-#[test]
-fn skip_and_overflow_detection_cover_edge_cases() {
-    assert!(should_skip_memory_context_entry("note_history", "short"));
-    assert!(should_skip_memory_context_entry(
-        "note",
-        &"x".repeat(MEMORY_CONTEXT_MAX_CHARS + 1)
-    ));
-    assert!(!should_skip_memory_context_entry("note", "short"));
-
-    assert!(is_context_window_overflow_error(&anyhow::anyhow!(
-        "Maximum context length exceeded"
-    )));
-    assert!(!is_context_window_overflow_error(&anyhow::anyhow!(
-        "network timeout"
-    )));
-}
-
-#[tokio::test]
-async fn build_memory_context_filters_entries_and_truncates_content() {
-    let mem = crate::memory::guard::in_memory::FixedRecallProvider::guarded(vec![
-        memory_entry("keep", "v", Some(0.9)),
-        memory_entry("drop_history", "ignored", Some(0.9)),
-        memory_entry("low", "too low", Some(0.1)),
-        memory_entry(
-            "long",
-            &"x".repeat(MEMORY_CONTEXT_ENTRY_MAX_CHARS + 50),
-            Some(0.9),
-        ),
-    ]);
-
-    let rendered = build_memory_context(&mem, "hello", 0.4).await;
-    assert!(rendered.starts_with("[Memory context]\n"));
-    assert!(rendered.contains("- keep: v"));
-    assert!(!rendered.contains("drop_history"));
-    assert!(!rendered.contains("too low"));
-    assert!(rendered.contains("- long: "));
-    assert!(rendered.contains("..."));
-}
-
-#[tokio::test]
-async fn build_memory_context_honors_total_budget_and_entry_limit() {
-    let entries = (0..10)
-        .map(|idx| memory_entry(&format!("k{idx}"), &"x".repeat(700), Some(0.9)))
-        .collect();
-    let mem = crate::memory::guard::in_memory::FixedRecallProvider::guarded(entries);
-
-    let rendered = build_memory_context(&mem, "hello", 0.4).await;
-    assert!(rendered.chars().count() <= MEMORY_CONTEXT_MAX_CHARS + 32);
-    assert!(rendered.matches("- k").count() <= MEMORY_CONTEXT_MAX_ENTRIES);
 }

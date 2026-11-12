@@ -50,9 +50,10 @@ pub fn install(
         privacy_mode: RwLock::new(policy.privacy_mode),
         generation: AtomicU64::new(0),
     });
-    if let Ok(mut guard) = state.policy.write() {
-        *guard = Arc::clone(&policy);
-    }
+    let Ok(mut policy_guard) = state.policy.write() else {
+        return policy;
+    };
+    *policy_guard = Arc::clone(&policy);
     if let Ok(mut guard) = state.workspace_dir.write() {
         *guard = workspace_dir;
     }
@@ -175,6 +176,21 @@ pub fn current() -> Option<Arc<SecurityPolicy>> {
         .and_then(|s| s.policy.read().ok().map(|g| Arc::clone(&g)))
 }
 
+/// The policy a call should be answered against: `ctx`'s agent's own policy
+/// when it carries one, else the process-global [`current`] policy.
+pub fn effective_in(ctx: &crate::core::runtime::DispatchCtx) -> Option<Arc<SecurityPolicy>> {
+    if let Some(policy) = ctx.agent_policy() {
+        return Some(policy);
+    }
+    if let Some(agent) = crate::core::runtime::agent_scope::current_agent_id() {
+        tracing::trace!(
+            agent_id = %agent,
+            "[security:live_policy] agent context carries no policy; using the process policy"
+        );
+    }
+    current()
+}
+
 /// Reload counter — incremented on every [`reload_from`]. Observability/tests.
 pub fn generation() -> u64 {
     STATE
@@ -182,79 +198,25 @@ pub fn generation() -> u64 {
         .map_or(0, |s| s.generation.load(Ordering::Relaxed))
 }
 
-/// Swap in a new `action_dir` and rebuild the live policy around it,
-/// bumping the generation counter. Used by
-/// [`config_set_action_dir`](crate::config::ops::set_action_dir)
-/// (issue #3240) so a Settings-driven change of the agent's writable root
-/// takes effect immediately instead of waiting for the next session.
-///
-/// Returns the new generation on success, or `Err` if no policy is
-/// installed yet (typically a CLI-only invocation that never started a
-/// session runtime).
-pub fn update_action_dir(new_action_dir: PathBuf) -> Result<u64, String> {
-    let Some(state) = STATE.get() else {
-        return Err(
-            "[security:live_policy] no policy installed yet — cannot update action_dir".into(),
-        );
-    };
-    {
-        let mut guard = state
-            .action_dir
-            .write()
-            .map_err(|e| format!("[security:live_policy] action_dir lock poisoned: {e}"))?;
-        *guard = new_action_dir.clone();
-    }
-    // Rebuild the policy by cloning the current one and swapping the
-    // action_dir field. This preserves the entire autonomy + trusted_roots
-    // + forbidden_paths state — the only thing changing is the sandbox root.
-    let current_policy = state
-        .policy
-        .read()
-        .map(|g| Arc::clone(&g))
-        .map_err(|e| format!("[security:live_policy] policy lock poisoned: {e}"))?;
-    let mut rebuilt: SecurityPolicy = (*current_policy).clone();
-    let previous_action_dir = rebuilt.action_dir.clone();
-    rebuilt.action_dir = new_action_dir.clone();
-    // The action dir is a granted read-write root (see
-    // `SecurityPolicy::from_config`), and this path does not go through
-    // `from_config` — so move the grant with the root. Without both halves a
-    // Settings-driven working-folder change either leaves writes refused in the
-    // new folder, or leaves the old folder writable after the user moved off it.
-    let previous_path = previous_action_dir.to_string_lossy().to_string();
-    rebuilt
-        .trusted_roots
-        .retain(|r| r.path != previous_path || previous_action_dir == new_action_dir);
-    let new_path = new_action_dir.to_string_lossy().to_string();
-    let covers_workspace = rebuilt.workspace_dir.starts_with(&new_action_dir);
-    if !new_path.is_empty()
-        && !covers_workspace
-        && !rebuilt.trusted_roots.iter().any(|r| r.path == new_path)
-    {
-        rebuilt.trusted_roots.push(crate::security::TrustedRoot {
-            path: new_path,
-            access: crate::security::TrustedAccess::ReadWrite,
-        });
-    }
-    {
-        let mut guard = state
-            .policy
-            .write()
-            .map_err(|e| format!("[security:live_policy] policy write lock poisoned: {e}"))?;
-        *guard = Arc::new(rebuilt);
-    }
-    let gen = state.generation.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::info!(
-        generation = gen,
-        "[security:live_policy] SecurityPolicy reloaded after action_dir change"
-    );
-    Ok(gen)
-}
-
 /// Rebuild the policy from `autonomy_config` against the stored workspace dir
 /// and swap it in, bumping the generation counter. No-op if nothing has been
 /// installed yet (e.g. a CLI invocation that never started a session runtime).
+/// A test thread holding an `install_scoped` policy owns its policy, so its
+/// reloads never reach the process-global one that sibling tests read.
 pub fn reload_from(autonomy_config: &crate::config::AutonomyConfig) {
+    #[cfg(test)]
+    if TEST_POLICY_OVERRIDE.with(|current| current.borrow().is_some()) {
+        tracing::trace!("[security:live_policy] reload skipped for scoped test policy");
+        return;
+    }
     let Some(state) = STATE.get() else {
+        return;
+    };
+    // Serialize the read/modify/write with privacy and action-directory swaps.
+    // Holding this guard while reading the stored fields prevents a concurrent
+    // setter from being overwritten by a stale policy clone.
+    let Ok(mut policy_guard) = state.policy.write() else {
+        tracing::warn!("[security:live_policy] policy write lock poisoned; reload skipped");
         return;
     };
     let workspace = state
@@ -275,9 +237,8 @@ pub fn reload_from(autonomy_config: &crate::config::AutonomyConfig) {
         SecurityPolicy::from_config(autonomy_config, &workspace, &action)
             .with_privacy_mode(stored_privacy),
     );
-    if let Ok(mut guard) = state.policy.write() {
-        *guard = rebuilt;
-    }
+    *policy_guard = rebuilt;
+    drop(policy_guard);
     let gen = state.generation.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::info!(
         generation = gen,
@@ -301,26 +262,18 @@ pub fn reload_privacy(new_mode: PrivacyMode) -> Result<u64, String> {
             "[security:live_policy] no policy installed yet — cannot update privacy_mode".into(),
         );
     };
-    {
-        let mut guard = state
-            .privacy_mode
-            .write()
-            .map_err(|e| format!("[security:live_policy] privacy_mode lock poisoned: {e}"))?;
-        *guard = new_mode;
-    }
-    let current_policy = state
+    let mut policy_guard = state
         .policy
-        .read()
-        .map(|g| Arc::clone(&g))
-        .map_err(|e| format!("[security:live_policy] policy lock poisoned: {e}"))?;
-    let rebuilt = (*current_policy).clone().with_privacy_mode(new_mode);
-    {
-        let mut guard = state
-            .policy
-            .write()
-            .map_err(|e| format!("[security:live_policy] policy write lock poisoned: {e}"))?;
-        *guard = Arc::new(rebuilt);
-    }
+        .write()
+        .map_err(|e| format!("[security:live_policy] policy write lock poisoned: {e}"))?;
+    let mut privacy_guard = state
+        .privacy_mode
+        .write()
+        .map_err(|e| format!("[security:live_policy] privacy_mode lock poisoned: {e}"))?;
+    *privacy_guard = new_mode;
+    *policy_guard = Arc::new((**policy_guard).clone().with_privacy_mode(new_mode));
+    drop(privacy_guard);
+    drop(policy_guard);
     let gen = state.generation.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::info!(
         generation = gen,
@@ -349,43 +302,32 @@ pub fn set_action_dir(new: PathBuf) {
         return;
     };
 
-    if let Ok(mut guard) = state.action_dir.write() {
-        *guard = new.clone();
-    }
-
-    let rebuilt = match state.policy.read() {
-        Ok(current) => Some({
-            let mut next = (**current).clone();
-            next.action_dir = new.clone();
-            Arc::new(next)
-        }),
-        Err(_) => {
+    let Ok(mut policy_guard) = state.policy.write() else {
+        if let Ok(mut action_guard) = state.action_dir.write() {
+            *action_guard = new.clone();
+        }
+        {
             tracing::warn!(
                 action_dir = %new.display(),
-                "[security:live_policy] set_action_dir: policy read lock poisoned; \
+                "[security:live_policy] set_action_dir: policy lock poisoned; \
                  action_dir stored but live policy not swapped — next reload_from will reconcile"
             );
-            None
         }
+        return;
     };
-
-    if let Some(rebuilt) = rebuilt {
-        if let Ok(mut guard) = state.policy.write() {
-            *guard = rebuilt;
-        } else {
-            tracing::warn!(
-                action_dir = %new.display(),
-                "[security:live_policy] set_action_dir: policy write lock poisoned; \
-                 rebuilt policy discarded — next reload_from will reconcile"
-            );
-        }
-        let generation = state.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::info!(
-            generation,
-            action_dir = %new.display(),
-            "[security:live_policy] SecurityPolicy action_dir swapped after agent-paths change"
-        );
+    if let Ok(mut action_guard) = state.action_dir.write() {
+        *action_guard = new.clone();
     }
+    let mut next = (**policy_guard).clone();
+    next.action_dir = new.clone();
+    *policy_guard = Arc::new(next);
+    drop(policy_guard);
+    let generation = state.generation.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(
+        generation,
+        action_dir = %new.display(),
+        "[security:live_policy] SecurityPolicy action_dir swapped after agent-paths change"
+    );
 }
 
 #[cfg(test)]

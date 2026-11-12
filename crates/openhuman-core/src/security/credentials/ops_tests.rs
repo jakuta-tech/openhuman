@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::test_env::EnvVarGuard;
 use crate::config::{default_root_openhuman_dir, user_openhuman_dir, write_active_user_id, Config};
 use crate::security::credentials::session_support::local_session_user_id;
 use crate::security::credentials::{
@@ -13,55 +14,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVarGuard {
-    fn set_to_path(key: &'static str, path: &std::path::Path) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe { std::env::set_var(key, path) };
-        Self { key, previous }
-    }
-
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
-
 fn test_config(tmp: &TempDir) -> Config {
-    let config = Config {
-        workspace_dir: tmp.path().join("workspace"),
-        action_dir: tmp.path().join("workspace"),
-        config_path: tmp.path().join("config.toml"),
-        ..Config::default()
-    };
-    // Storing a session asks the memory driver to re-embed, and resolving a
-    // driver that nothing has installed means attempting to load the compiled
-    // module — which a unit test cannot do, but takes seconds to fail at.
-    // These are credentials tests; binding is not what they are about, and one
-    // of them asserts a latency budget that the attempt blows straight through.
-    crate::memory::binding::install_diagnostics_for_test(
-        &config.workspace_dir,
-        &config.subsystems.memory,
-        Default::default(),
-        Default::default(),
-    );
-    config
+    crate::credentials::test_support::plaintext_fixture_config(tmp.path())
 }
 
 fn jwt_with_payload(payload: serde_json::Value) -> String {
@@ -87,7 +41,7 @@ async fn spawn_auth_me_status(status: StatusCode) -> String {
 /// caller's mock backend only has to answer the route under test — `store_session`
 /// would additionally need `/auth/me` to succeed first, and re-scopes the profile
 /// to the resolved user directory as a side effect.
-fn store_live_session(user_id: &str) -> Config {
+async fn store_live_session(user_id: &str) -> Config {
     let root_dir = default_root_openhuman_dir().unwrap();
     write_active_user_id(&root_dir, user_id).unwrap();
     let user_dir = user_openhuman_dir(&root_dir, user_id);
@@ -115,10 +69,16 @@ fn store_live_session(user_id: &str) -> Config {
             metadata,
             true,
         )
+        .await
         .unwrap();
     config
 }
 
+#[path = "ops_credential_local_session_tests.rs"]
+mod credential_local_session_tests;
+#[cfg(feature = "storage-sqlite")]
+#[path = "ops_credential_per_user_storage_tests.rs"]
+mod credential_per_user_storage_tests;
 #[path = "ops_credential_tests.rs"]
 mod credential_tests;
 #[path = "ops_provider_oauth_tests.rs"]

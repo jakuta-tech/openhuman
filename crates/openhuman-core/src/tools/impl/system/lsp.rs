@@ -50,6 +50,10 @@ impl Default for LspTool {
 
 #[async_trait]
 impl Tool for LspTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "lsp"
     }
@@ -93,7 +97,7 @@ impl Tool for LspTool {
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
         Ok(ToolResult::error(
-            "lsp backend not yet implemented — capability gate is on but no language server is wired. Track this in the follow-up issue."
+            "lsp backend not yet implemented — capability gate is on but no language server is wired. Track this in the follow-up issue.",
         ))
     }
 }

@@ -4,11 +4,11 @@ import { useEffect, useRef, useState } from 'react';
 import { useT } from '../../../lib/i18n/I18nContext';
 import {
   type AutonomyLevel,
-  isTauri,
   openhumanGetAgentSettings,
   openhumanGetAutonomySettings,
   openhumanUpdateAgentSettings,
   openhumanUpdateAutonomySettings,
+  type ToolDispatcher,
   type TrustedAccess,
   type TrustedRoot,
 } from '../../../utils/tauriCommands';
@@ -26,6 +26,7 @@ import {
 import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
 import SettingsPanel from '../layout/SettingsPanel';
 import AutonomyRateLimitSection from './AutonomyPanel';
+import FilesFolderSection from './FilesFolderSection';
 
 // Installs are always *available* but never silent: every `install_tool` call
 // is routed through the approval gate, so the user is asked to Approve/Deny
@@ -45,8 +46,7 @@ const AgentAccessPanel = () => {
   const [workspaceOnly, setWorkspaceOnly] = useState(false);
   // Blanket "auto-approve everything" bypass — off by default. Hard security
   // blocks (credential dirs, workspace-internal paths) and the
-  // subconscious-tainted / unlabelled-origin denials in the approval gate
-  // are unaffected by this setting; see `settings.agentAccess.autoApproveAll.desc`.
+  // unlabelled-origin denial in the approval gate are unaffected by this setting; see `settings.agentAccess.autoApproveAll.desc`.
   const [autoApproveAll, setAutoApproveAll] = useState(false);
   const [trustedRoots, setTrustedRoots] = useState<TrustedRoot[]>([]);
   // "Always allow" allowlist — populated by the in-chat "Always allow" button;
@@ -68,6 +68,13 @@ const AgentAccessPanel = () => {
   const [timeoutSavedNote, setTimeoutSavedNote] = useState<string | null>(null);
   const timeoutSeqRef = useRef(0);
 
+  // Tool-call dialect (`agent.tool_dispatcher`). `auto` = JSON, the default.
+  const [toolDispatcher, setToolDispatcher] = useState<ToolDispatcher>('auto');
+  const [toolDispatcherEnvOverride, setToolDispatcherEnvOverride] = useState(false);
+  const [toolDispatcherError, setToolDispatcherError] = useState<string | null>(null);
+  const [toolDispatcherSavedNote, setToolDispatcherSavedNote] = useState<string | null>(null);
+  const toolDispatcherSeqRef = useRef(0);
+
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -79,10 +86,6 @@ const AgentAccessPanel = () => {
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      if (!isTauri()) {
-        setIsLoading(false);
-        return;
-      }
       try {
         const autonomyResp = await openhumanGetAutonomySettings();
         if (cancelled) return;
@@ -103,6 +106,8 @@ const AgentAccessPanel = () => {
         setTimeoutEnvOverride(agentResp.result.env_override);
         setTimeoutMin(agentResp.result.min_timeout_secs);
         setTimeoutMax(agentResp.result.max_timeout_secs);
+        setToolDispatcher(agentResp.result.tool_dispatcher ?? 'auto');
+        setToolDispatcherEnvOverride(agentResp.result.tool_dispatcher_env_override ?? false);
       } catch {
         // Non-fatal: autonomy controls still render; timeout section
         // stays at defaults and the user can try saving manually.
@@ -145,7 +150,6 @@ const AgentAccessPanel = () => {
     onError?: () => void
   ) => {
     const seq = ++persistSeqRef.current;
-    if (!isTauri()) return;
     setError(null);
     setSavedNote(null);
     setIsSaving(true);
@@ -170,6 +174,28 @@ const AgentAccessPanel = () => {
     } finally {
       if (persistSeqRef.current === seq) {
         setIsSaving(false);
+      }
+    }
+  };
+
+  // Persist the tool-call format on change; revert the select if the save fails.
+  const changeToolDispatcher = async (next: ToolDispatcher) => {
+    const prev = toolDispatcher;
+    const seq = ++toolDispatcherSeqRef.current;
+    setToolDispatcher(next);
+    setToolDispatcherError(null);
+    setToolDispatcherSavedNote(null);
+    try {
+      await openhumanUpdateAgentSettings({ tool_dispatcher: next });
+      if (toolDispatcherSeqRef.current === seq) {
+        setToolDispatcherSavedNote(t('settings.agentAccess.saved'));
+      }
+    } catch (e) {
+      if (toolDispatcherSeqRef.current === seq) {
+        setToolDispatcher(prev);
+        setToolDispatcherError(
+          e instanceof Error ? e.message : t('settings.agentAccess.saveError')
+        );
       }
     }
   };
@@ -224,7 +250,6 @@ const AgentAccessPanel = () => {
   // from the autonomy `persist` path so a timeout edit can't clobber the
   // autonomy block and vice-versa.
   const commitTimeout = async () => {
-    if (!isTauri()) return;
     const trimmed = timeoutInput.trim();
     const parsed = Number(trimmed);
     if (!Number.isInteger(parsed) || parsed < timeoutMin || parsed > timeoutMax) {
@@ -261,13 +286,6 @@ const AgentAccessPanel = () => {
 
   return (
     <SettingsPanel description={t('settings.agentAccess.menuDesc')}>
-      {/* Desktop-only notice */}
-      {!isTauri() && (
-        <Alert variant="info" density="compact">
-          <AlertDescription>{t('settings.agentAccess.desktopOnly')}</AlertDescription>
-        </Alert>
-      )}
-
       {isLoading ? (
         <p className="text-sm text-content-muted">{t('settings.agentAccess.loading')}</p>
       ) : (
@@ -351,6 +369,8 @@ const AgentAccessPanel = () => {
 
           {/* ── File system: where the agent may read and write ─────────── */}
           <Card title={t('settings.agentAccess.group.fileSystem')}>
+            <FilesFolderSection />
+
             <Field
               htmlFor="switch-workspace-only"
               label={t('settings.agentAccess.confine.label')}
@@ -480,6 +500,57 @@ const AgentAccessPanel = () => {
                 </div>
               )}
             </div>
+          </Card>
+
+          {/* ── Tool-call format: JSON by default, code styles opt-in ────── */}
+          <Card title={t('settings.agentAccess.toolFormat.label')}>
+            <Field
+              htmlFor="tool-dispatcher-select"
+              label={t('settings.agentAccess.toolFormat.label')}
+              description={t('settings.agentAccess.toolFormat.desc')}
+              control={
+                <SettingsSelect
+                  id="tool-dispatcher-select"
+                  value={toolDispatcher}
+                  onChange={e => void changeToolDispatcher(e.target.value as ToolDispatcher)}
+                  disabled={toolDispatcherEnvOverride}
+                  aria-label={t('settings.agentAccess.toolFormat.label')}
+                  inputSize="sm"
+                  className="w-64">
+                  <option value="auto">{t('settings.agentAccess.toolFormat.option.auto')}</option>
+                  <option value="native">
+                    {t('settings.agentAccess.toolFormat.option.native')}
+                  </option>
+                  <option value="xml">{t('settings.agentAccess.toolFormat.option.xml')}</option>
+                  <option value="pformat">
+                    {t('settings.agentAccess.toolFormat.option.pformat')}
+                  </option>
+                  <option value="python">
+                    {t('settings.agentAccess.toolFormat.option.python')}
+                  </option>
+                  <option value="typescript">
+                    {t('settings.agentAccess.toolFormat.option.typescript')}
+                  </option>
+                </SettingsSelect>
+              }
+            />
+            {(toolDispatcherEnvOverride || toolDispatcherSavedNote || toolDispatcherError) && (
+              <div className="space-y-2 px-4 pb-3">
+                {toolDispatcherEnvOverride && (
+                  <Alert variant="warning" density="compact" role={undefined}>
+                    <AlertDescription>
+                      {t('settings.agentAccess.toolFormat.envOverride')}
+                    </AlertDescription>
+                  </Alert>
+                )}
+                <SettingsStatusLine
+                  saving={false}
+                  savedNote={toolDispatcherSavedNote}
+                  error={toolDispatcherError}
+                  savingLabel={t('settings.agentAccess.saving')}
+                />
+              </div>
+            )}
           </Card>
 
           {/* Action rate limit (formerly the standalone /settings/autonomy page) */}

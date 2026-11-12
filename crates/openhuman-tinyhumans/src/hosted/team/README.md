@@ -16,19 +16,19 @@ Team management RPC adapters. This domain is a **thin proxy to the hosted backen
 
 | File | Role |
 | --- | --- |
-| `crates/openhuman-tinyhumans/src/hosted/team/mod.rs` | Export-only: declares `ops`/`schemas`, re-exports all ops fns and the controller-schema pair. |
-| `crates/openhuman-tinyhumans/src/hosted/team/ops.rs` | Business logic: async fns that build a path, attach the session JWT, call the backend, and wrap the response in `RpcOutcome::single_log`. Contains URL-path builder + id-normalization helpers and their unit tests. |
-| `crates/openhuman-tinyhumans/src/hosted/team/schemas.rs` | Controller schemas (`all_team_controller_schemas`, `all_team_registered_controllers`, `team_schemas`), param structs, and `handle_*` adapters that load config, deserialize params, and delegate to `ops`. |
-| `crates/openhuman-tinyhumans/src/hosted/team/schemas_tests.rs` | Sibling test module for `schemas.rs` (wired via `#[path]`). |
+| [`crates/openhuman-tinyhumans/src/hosted/team/mod.rs`](mod.rs) | Export-only: declares `ops`/`schemas`, re-exports all ops fns and the controller-schema pair. |
+| [`crates/openhuman-tinyhumans/src/hosted/team/ops.rs`](ops.rs) | Business logic: async fns that build a path, attach the session JWT, call the backend, and wrap the response in `Outcome::single_log`. Contains URL-path builder + id-normalization helpers and their unit tests. |
+| [`crates/openhuman-tinyhumans/src/hosted/team/schemas.rs`](schemas.rs) | Controller schemas (`all_team_controller_schemas`, `all_team_registered_controllers`, `team_schemas`), param structs, and `handle_*` adapters that load config, deserialize params, and delegate to `ops`. |
+| [`crates/openhuman-tinyhumans/src/hosted/team/schemas_tests.rs`](schemas_tests.rs) | Sibling test module for `schemas.rs` (wired via `#[path]`). |
 
 ## Public surface
 
-Re-exported from `mod.rs`:
+Re-exported from [`mod.rs`](mod.rs):
 
-- **Ops (all `async fn(... ) -> Result<RpcOutcome<Value>, String>`):** `get_usage` (re-exported from `integrations::client::budget_gate`, which owns the `/teams/me/usage` probe, its failure backoff and the managed-tool budget gate: the integrations client is its main consumer), `list_members`, `list_teams`, `get_team`, `create_team`, `update_team`, `delete_team`, `switch_team`, `leave_team`, `join_team`, `create_invite`, `remove_member`, `change_member_role`, `list_invites`, `revoke_invite`.
+- **Ops (all `async fn(... ) -> Result<RpcOutcome<Value>, String>`):** `get_usage` (`GET /teams/me/usage` on the SDK, behind the core's shared failure backoff `integrations::client::budget_gate::usage_with_failure_backoff`; the core keeps only the managed-tool pre-call probe), `list_members`, `list_teams`, `get_team`, `create_team`, `update_team`, `delete_team`, `switch_team`, `leave_team`, `join_team`, `create_invite`, `remove_member`, `change_member_role`, `list_invites`, `revoke_invite`.
 - **Schemas:** `all_team_controller_schemas`, `all_team_registered_controllers`, `team_schemas`.
 
-Internal helpers in `ops.rs` (`require_token`, `normalize_id`, `build_api_path`, `get_authed_value`) are private.
+Internal helpers in [`ops.rs`](ops.rs) (`normalize_id`, `clamp_u32`, `legacy_authed_value`) are private. `create_team` / `delete_team` stay on the core's `BackendClient::authed_json` (`legacy_authed_value`) because the SDK carries no route for `POST /teams` / `DELETE /teams/{teamId}`.
 
 ## RPC / controllers
 
@@ -64,21 +64,20 @@ None. No `bus.rs`; publishes/subscribes to no `DomainEvent`s.
 
 ## Persistence
 
-None local. State lives in the hosted backend. The only stored value it reads is the app-session JWT, fetched via `crate::api::jwt::get_session_token` (written by `auth_store_session`); it is sent as `Authorization: Bearer …` and never logged.
+None local. State lives in the hosted backend. The only stored value it reads is the backend credential, resolved through `HostedClient` (session JWT as `Authorization: Bearer`, API key as `x-api-key`); it is never logged.
 
 ## Dependencies
 
-- `crate::api::config::effective_backend_api_url`: resolves the backend base URL from `Config.api_url`.
-- `crate::api::jwt::get_session_token`: pulls the session JWT used to authenticate every request.
-- `crate::api::BackendOAuthClient`: HTTP client; `authed_json(token, method, path, body)` performs the authed call.
+- `crate::backend::url::effective_backend_api_url`: resolves the backend base URL from `Config.api_url`.
+- `crate::hosted::client::HostedClient`: resolves the core's backend credential first (no request without one), builds the SDK's `TinyHumansClient`, and maps SDK errors onto the core's RPC sentinels.
 - `crate::config::Config`: config passed into every op; `config::rpc::load_config_with_timeout` loads it inside each `handle_*`.
 - `crate::core::all::{ControllerFuture, RegisteredController}` and `crate::core::{ControllerSchema, FieldSchema, TypeSchema}`: controller registry types.
 - `crate::rpc::RpcOutcome`: return wrapper (`single_log`).
-- `reqwest` (`Method`, `Url`) for HTTP + path building; `serde` / `serde_json` for params and bodies.
+- `tinyhumans-sdk` typed `teams()` client; `serde` / `serde_json` for params and bodies.
 
 ## Used by
 
-- `crates/openhuman-core/src/core/all.rs`: registers `all_team_registered_controllers()` into the controller registry and `all_team_controller_schemas()` into the schema list (the standard controller-only exposure path). No domain branches in `cli.rs` / `jsonrpc.rs`.
+- [`crates/openhuman-core/src/core/all.rs`](../../../../openhuman-core/src/core/all.rs): registers `all_team_registered_controllers()` into the controller registry and `all_team_controller_schemas()` into the schema list (the standard controller-only exposure path). No domain branches in `cli.rs` / `jsonrpc.rs`.
 
 ## Notes / gotchas
 
@@ -88,3 +87,9 @@ None local. State lives in the hosted backend. The only stored value it reads is
 - **Validation precedence is deterministic** (tested): `team_id` is normalized before `user_id` before `role`, so error messages are stable regardless of which other fields are also invalid.
 - `update_team` only includes `name` in the body when present and non-empty after trimming; an empty/whitespace name is dropped rather than sent.
 - Missing/blank session token yields `no backend session token; run auth_store_session first` before any network attempt.
+
+## Further reading
+
+- [`docs/gitbooks/en/developing/tinyhumans-api-key.md`](../../../../../docs/gitbooks/en/developing/tinyhumans-api-key.md): running on a TinyHumans API key.
+- [`crates/openhuman-tinyhumans/src/hosted/README.md`](../README.md): hosted proxies.
+- [`vendor/tinyhumans-sdk/README.md`](../../../../../vendor/tinyhumans-sdk/README.md): tinyhumans-sdk.

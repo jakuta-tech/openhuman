@@ -4,8 +4,6 @@ mod boot_env;
 mod composio;
 mod credential;
 mod gated_services;
-mod login_tokens;
-mod oauth;
 mod provider_credentials;
 mod secrets;
 mod session_query;
@@ -18,19 +16,15 @@ pub use composio::{
     clear_composio_api_key, get_composio_api_key, rpc_store_composio_api_key,
     store_composio_api_key, COMPOSIO_DIRECT_PROVIDER,
 };
+#[cfg(test)]
+pub(crate) use credential::clear_credential_with;
+#[cfg(test)]
+pub(crate) use credential::restore_api_key;
 pub use credential::{
     clear_credential, clear_session, set_credential, store_session, SetCredentialRequest,
     PENDING_BACKEND_VALIDATION_FIELD,
 };
-pub use gated_services::{
-    start_credential_gated_services, start_login_gated_services, stop_credential_gated_services,
-    stop_login_gated_services,
-};
-pub use login_tokens::auth_create_channel_link_token;
-pub use oauth::{
-    oauth_connect, oauth_fetch_client_key, oauth_fetch_integration_tokens, oauth_list_integrations,
-    oauth_revoke_integration,
-};
+pub use gated_services::{start_credential_gated_services, stop_credential_gated_services};
 pub use provider_credentials::{
     list_provider_credentials, list_provider_credentials_by_prefix, remove_provider_credentials,
     store_provider_credentials,

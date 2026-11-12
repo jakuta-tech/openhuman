@@ -26,6 +26,10 @@ impl SecurityPolicyInfoTool {
 
 #[async_trait]
 impl Tool for SecurityPolicyInfoTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "security_policy_info"
     }
@@ -49,6 +53,13 @@ impl Tool for SecurityPolicyInfoTool {
     fn is_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
         true
     }
+}
+
+/// Build this domain's tools in their persisted catalogue order.
+pub(crate) fn registered_tools(
+    config: std::sync::Arc<crate::config::Config>,
+) -> Vec<Box<dyn tinytools::Tool>> {
+    vec![Box::new(SecurityPolicyInfoTool::new(config.clone()))]
 }
 
 #[cfg(test)]

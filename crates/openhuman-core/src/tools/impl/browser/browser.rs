@@ -1,11 +1,20 @@
-//! Agent-facing browser backed by the TinyBrowser module.
+//! Agent-facing browser backed by the TinyComputer module's browser and task members.
+#[path = "browser_lifecycle.rs"]
+mod cleanup;
+#[path = "browser_pending.rs"]
+mod pending;
 #[path = "browser_session_pool.rs"]
 mod session_pool;
-
+#[path = "browser_task_actions.rs"]
+mod task_actions;
+#[path = "browser_unattended.rs"]
+mod unattended;
+use crate::core::runtime::turn_origin::AgentTurnOrigin;
 use crate::modules::browser::BrowserClient;
 use crate::security::approval::{ApprovalGate, GateOutcome};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use pending::{approval_target, needs_host_confirmation, Pending};
 use serde_json::{json, Value};
 use session_pool::{
     browser_session_fingerprint, evict_thread_sessions, requires_rebind, thread_sessions,
@@ -14,102 +23,38 @@ use session_pool::{
 #[cfg(test)]
 use session_pool::{MAX_THREAD_SESSIONS, SESSION_IDLE_TTL};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::{collections::HashMap, time::Duration};
 use std::{
-    collections::BTreeMap,
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
-#[cfg(test)]
-use std::{collections::HashMap, time::Duration};
-use tinybrowser_bus::{
-    Action, DownloadState, DownloadWaitRequest, LocateBy, Locator, NavigateRequest, ReadRequest,
-    ScrollDirection, SessionId, SessionOptions, Snapshot, SnapshotRequest, Target, WaitState,
+use task_actions::{
+    approve_task_action, direct_action, host_hint, required, task_inputs, task_outcome,
 };
-use tinybrowser_control::{BrowserControl, BrowserControlError, TaskRequest, TaskStatus};
+use tinycomputer_bus::agent::{ContinueTaskRequest, TaskId, TaskStatus, TaskView};
+use tinycomputer_bus::browser::{
+    Action, DownloadState, DownloadWaitRequest, NavigateRequest, ReadRequest, SessionId,
+    SessionOptions, SnapshotRequest,
+};
 use tinytools::{Tool, ToolCallOptions, ToolResult, ToolRunContext};
 use tokio::sync::Mutex;
-
-struct Pending {
-    session: SessionId,
-    action: Action,
-    url: String,
-    token: String,
-}
-
-impl Pending {
-    fn matches(&self, args: &Value) -> bool {
-        args["token"].as_str() == Some(self.token.as_str())
-            && serde_json::to_value(&self.action).ok().as_ref() == Some(&args["pending_action"])
-    }
-}
-
-struct BudgetedBrowser<'a> {
-    client: &'a BrowserClient,
-    security: &'a SecurityPolicy,
-}
-
-fn needs_host_confirmation(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::Click { .. }
-            | Action::DoubleClick { .. }
-            | Action::Fill { .. }
-            | Action::Type { .. }
-            | Action::Press { .. }
-            | Action::Select { .. }
-            | Action::Check { .. }
-    )
-}
-
-fn approval_target(action: &Action) -> (Option<&str>, String) {
-    let target = match action {
-        Action::Click { target, .. }
-        | Action::DoubleClick { target }
-        | Action::Fill { target, .. }
-        | Action::Select { target, .. }
-        | Action::Check { target, .. } => Some(target),
-        Action::Type { target, .. } => target.as_ref(),
-        _ => None,
-    };
-    let preview = |raw: &str| {
-        let cleaned = raw.chars().filter(|c| !c.is_control()).collect::<String>();
-        let mut short = cleaned.chars().take(96).collect::<String>();
-        if cleaned.chars().count() > 96 {
-            short.push('…');
-        }
-        short
-    };
-    match target {
-        Some(Target::Ref { value }) => (Some(value), format!(" @{value}")),
-        Some(Target::Selector { value }) => (None, format!(" CSS selector {:?}", preview(value))),
-        Some(Target::Locator { value }) => {
-            let name = value
-                .name
-                .as_deref()
-                .map(|name| format!(" named {:?}", preview(name)))
-                .unwrap_or_default();
-            (
-                None,
-                format!(
-                    " {:?} locator {:?}{name} (match {}, exact={})",
-                    value.by,
-                    preview(&value.value),
-                    value.index.saturating_add(1),
-                    value.exact
-                ),
-            )
-        }
-        None => (None, String::new()),
-    }
-}
 
 async fn approve_browser_action(
     client: &BrowserClient,
     session: &SessionId,
     action: &Action,
     force: bool,
+    origin: Option<&AgentTurnOrigin>,
 ) -> anyhow::Result<()> {
     if !force && !needs_host_confirmation(action) {
+        return Ok(());
+    }
+    let action_json = serde_json::to_value(action)?;
+    let kind = action_json["action"].as_str().unwrap_or("action");
+    // Nobody waits on an unattended approval, so the page needs no binding.
+    let action_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&action_json)?));
+    if unattended::allow(origin, &client.config().browser, kind, &action_digest) {
         return Ok(());
     }
     let gate = ApprovalGate::try_global().ok_or_else(|| {
@@ -124,8 +69,6 @@ async fn approve_browser_action(
             },
         )
         .await?;
-    let action_json = serde_json::to_value(action)?;
-    let kind = action_json["action"].as_str().unwrap_or("action");
     let origin = reqwest::Url::parse(&before.url)
         .ok()
         .map(|url| url.origin().ascii_serialization())
@@ -137,7 +80,7 @@ async fn approve_browser_action(
     let input_detail = match action {
         Action::Fill { value, .. } => format!(" ({} input characters)", value.chars().count()),
         Action::Type { text, .. } => format!(" ({} input characters)", text.chars().count()),
-        Action::Press { key } => format!(" ({key})"),
+        Action::Press { key, .. } => format!(" ({key})"),
         _ => String::new(),
     };
     let digest_hex = format!("{digest:x}");
@@ -146,9 +89,7 @@ async fn approve_browser_action(
         &digest_hex[..12]
     );
     let summary = format!("Browser {display_target}");
-    // A digest binds the prompt to the complete action and URL without
-    // persisting form values or sensitive URL query parameters. The bounded
-    // selector/locator preview lets the host review which element is targeted.
+    // Bind action and URL with a digest, and show a bounded selector preview.
     let args = json!({"action": kind, "origin": origin, "target": display_target,
         "target_ref": target_ref, "exact_action_sha256": digest_hex});
     match gate.intercept_forced("browser", &summary, args).await {
@@ -168,36 +109,6 @@ async fn approve_browser_action(
         anyhow::bail!("Browser page changed during host approval");
     }
     Ok(())
-}
-
-impl BrowserControl for BudgetedBrowser<'_> {
-    async fn snapshot(
-        &self,
-        session: &SessionId,
-        request: &SnapshotRequest,
-    ) -> Result<Snapshot, BrowserControlError> {
-        BrowserControl::snapshot(self.client, session, request).await
-    }
-
-    async fn perform(
-        &self,
-        session: &SessionId,
-        action: &Action,
-    ) -> Result<tinybrowser_bus::ActionOutcome, BrowserControlError> {
-        approve_browser_action(self.client, session, action, false)
-            .await
-            .map_err(|error| BrowserControlError {
-                name: "HostApprovalDenied".into(),
-                message: error.to_string(),
-            })?;
-        if !self.security.record_action() {
-            return Err(BrowserControlError {
-                name: "ActionBudgetExceeded".into(),
-                message: "Browser action budget exceeded".into(),
-            });
-        }
-        BrowserControl::perform(self.client, session, action).await
-    }
 }
 
 pub struct BrowserTool {
@@ -255,9 +166,7 @@ impl BrowserTool {
                 *held = None;
                 *bound = None;
                 *self.pending.lock().await = None;
-                // The previous module session retains its original allowed
-                // origins. Keep its entry until close succeeds so a failed
-                // close is retried before any replacement can open.
+                // Keep its entry until close succeeds; retry before replacement.
                 stale.client.close_session(&stale.id).await?;
                 sessions.remove(&key);
             }
@@ -343,82 +252,121 @@ impl BrowserTool {
         Ok(json!({"closed": true}))
     }
 
-    async fn task(&self, id: &SessionId, args: &Value) -> anyhow::Result<Value> {
-        let mut request = TaskRequest::new(required(args, "goal")?);
-        if let Some(inputs) = args["inputs"].as_object() {
-            let values = inputs
-                .iter()
-                .map(|(k, v)| {
-                    Ok((
-                        k.clone(),
-                        v.as_str()
-                            .ok_or_else(|| anyhow::anyhow!("Task input '{k}' must be text"))?
-                            .to_owned(),
-                    ))
-                })
-                .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-            request = request.with_inputs(values);
-        }
-        let browser = BudgetedBrowser {
-            client: &self.client,
-            security: &self.security,
+    async fn task(&self, args: &Value) -> anyhow::Result<Value> {
+        let mut goal = required(args, "goal")?.to_owned();
+        let site = args["url"]
+            .as_str()
+            .and_then(crate::modules::site_memory_host::site_of);
+        let origins = match args["url"].as_str().filter(|url| !url.trim().is_empty()) {
+            Some(url) => {
+                self.client.check_url(url)?;
+                goal = format!("Start at {url}. {goal}");
+                self.client
+                    .explicit_origin(url)?
+                    .map_or_else(|| self.client.task_origins(), |origin| vec![origin])
+            }
+            None => self.client.task_origins(),
         };
-        let result = crate::modules::browser_task::run(
-            &browser,
-            self.client.config(),
-            id,
-            request.clone(),
-            self.max_steps,
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        // The module can follow a link or redirect outside the configured
-        // origins. The host must refuse to report that state as a successful
-        // task, even though strict prevention requires module-level interception.
-        self.client
-            .read_page(
-                id,
-                ReadRequest {
-                    max_chars: 1,
-                    ..ReadRequest::default()
+        let facts = task_inputs(args)?;
+        let flow = match args.get("flow").filter(|flow| !flow.is_null()) {
+            Some(flow) => Some(
+                serde_json::from_value::<tinycomputer_bus::Flow>(flow.clone())
+                    .map_err(|error| anyhow::anyhow!("Invalid flow: {error}"))?,
+            ),
+            None => None,
+        };
+        let task = crate::modules::browser_task::BrowserTask {
+            goal,
+            facts,
+            origins,
+            max_actions: u32::try_from(self.max_steps).unwrap_or(u32::MAX),
+            flow,
+            site,
+        };
+        // The browser this conversation keeps open holds the persistent
+        // profile, which the task's own browser needs: it is let go first.
+        if self.client.config().browser.profile_mode == "persistent" {
+            if let Err(error) = self.close().await {
+                tracing::debug!(
+                    error = %error,
+                    "[tool.browser] could not close this conversation's browser before a task"
+                );
+            }
+        }
+        let view = crate::modules::browser_task::start(self.client.config(), &task)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        self.report(view).await
+    }
+
+    /// Answer a paused task (inputs, a free-text answer) or keep following a
+    /// running one.
+    async fn task_continue(&self, args: &Value) -> anyhow::Result<Value> {
+        let id = TaskId::new(required(args, "task_id")?);
+        let inputs = task_inputs(args)?;
+        let answer = args["answer"].as_str().map(str::to_owned);
+        let view = if inputs.is_empty() && answer.is_none() {
+            crate::modules::browser_task::wait(self.client.config(), id).await
+        } else {
+            crate::modules::browser_task::resume(
+                self.client.config(),
+                ContinueTaskRequest {
+                    id,
+                    inputs,
+                    answer,
+                    ..ContinueTaskRequest::default()
                 },
             )
-            .await?;
-        let steps = result
-            .steps
-            .iter()
-            .map(|step| {
-                json!({
-                    "step": step.step,
-                    "operation": format!("{:?}", step.decision.operation),
-                    "page_changed": step.page_changed,
-                    "outcome": format!("{:?}", step.outcome),
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut output = json!({"status": format!("{:?}", result.status), "steps": steps, "final_snapshot": result.final_snapshot});
-        if result.status == TaskStatus::NeedsConfirmation {
-            let decision = result
-                .pending
-                .ok_or_else(|| anyhow::anyhow!("No pending Jev decision"))?;
-            let action = decision
-                .to_action(&request, 250)?
-                .ok_or_else(|| anyhow::anyhow!("No pending action"))?;
+            .await
+        }
+        .map_err(anyhow::Error::msg)?;
+        self.report(view).await
+    }
+
+    async fn task_cancel(&self, args: &Value) -> anyhow::Result<Value> {
+        let id = TaskId::new(required(args, "task_id")?);
+        *self.pending.lock().await = None;
+        let view = crate::modules::browser_task::cancel(self.client.config(), id)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(serde_json::to_value(view)?)
+    }
+
+    /// Report a task view as the tool's outcome ([`task_outcome`]): a task
+    /// that failed or was cancelled under the caller is an error.
+    async fn report(&self, view: TaskView) -> anyhow::Result<Value> {
+        let output = self.describe(&view).await?;
+        task_outcome(&view, output)
+    }
+
+    /// Render a task view; a `needs_approval` pause is held with a one-use
+    /// token that only `confirm_pending` (through the host gate) can spend.
+    async fn describe(&self, view: &TaskView) -> anyhow::Result<Value> {
+        let mut output = serde_json::to_value(view)?;
+        if let Some(hint) = host_hint(view) {
+            output["host_hint"] = json!(hint);
+        }
+        if let TaskStatus::NeedsApproval { action, target, .. } = &view.status {
             let token = uuid::Uuid::new_v4().to_string();
             *self.pending.lock().await = Some(Pending {
-                session: id.clone(),
+                task: view.id.clone(),
                 action: action.clone(),
-                url: result.final_snapshot.url,
+                target: target.clone(),
                 token: token.clone(),
             });
-            output["pending"] = json!({"action": action, "token": token, "approval": "Call confirm_pending with this token and pending_action to request host approval for this exact action"});
+            output["pending"] = json!({"task_id": view.id, "action": action, "target": target,
+                "token": token, "approval": "Call confirm_pending with this token to request host approval for this exact action"});
         } else {
             *self.pending.lock().await = None;
         }
         Ok(output)
     }
 
-    async fn confirm_pending(&self, args: &Value) -> anyhow::Result<Value> {
+    async fn confirm_pending(
+        &self,
+        args: &Value,
+        origin: Option<&AgentTurnOrigin>,
+    ) -> anyhow::Result<Value> {
         let mut slot = self.pending.lock().await;
         let held = slot
             .as_ref()
@@ -428,38 +376,40 @@ impl BrowserTool {
         }
         let pending = slot.take().expect("pending checked above");
         drop(slot);
-        let page = self
-            .client
-            .read_page(
-                &pending.session,
-                ReadRequest {
-                    max_chars: 1,
-                    ..ReadRequest::default()
-                },
-            )
-            .await?;
-        if page.url != pending.url {
-            anyhow::bail!("Browser page changed during confirmation");
+        let approved = approve_task_action(&pending, &self.client.config().browser, origin).await?;
+        let view = crate::modules::browser_task::resume(
+            self.client.config(),
+            ContinueTaskRequest {
+                id: pending.task,
+                approve: Some(approved),
+                ..ContinueTaskRequest::default()
+            },
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let mut output = self.describe(&view).await?;
+        if !approved {
+            output["approval"] = json!("denied by the host");
         }
-        approve_browser_action(&self.client, &pending.session, &pending.action, true).await?;
-        Ok(serde_json::to_value(
-            self.client
-                .perform(&pending.session, pending.action)
-                .await?,
-        )?)
+        task_outcome(&view, output)
     }
 
-    async fn run(&self, args: &Value) -> anyhow::Result<Value> {
+    /// `origin` is the turn this call runs under; it decides only whether an
+    /// allow-listed action may skip the forced approval gate.
+    async fn run(&self, args: &Value, origin: Option<&AgentTurnOrigin>) -> anyhow::Result<Value> {
         let verb = required(args, "action")?;
         if verb == "close" {
             return self.close().await;
         }
-        if verb == "confirm_pending" {
-            return self.confirm_pending(args).await;
+        match verb {
+            "confirm_pending" => return self.confirm_pending(args, origin).await,
+            "task" => return self.task(args).await,
+            "task_continue" => return self.task_continue(args).await,
+            "task_cancel" => return self.task_cancel(args).await,
+            _ => {}
         }
         let starting_url = match verb {
             "open" => Some(required(args, "url")?),
-            "task" => args["url"].as_str().filter(|url| !url.trim().is_empty()),
             _ => None,
         };
         let id = self.session_for_url(starting_url).await?;
@@ -511,28 +461,6 @@ impl BrowserTool {
                     json!({"url":p.url})
                 })
             }
-            "task" => {
-                if let Some(url) = args["url"].as_str().filter(|url| !url.trim().is_empty()) {
-                    self.client.navigate(&id, NavigateRequest::new(url)).await?;
-                } else {
-                    let page = self
-                        .client
-                        .read_page(
-                            &id,
-                            ReadRequest {
-                                max_chars: 1,
-                                ..ReadRequest::default()
-                            },
-                        )
-                        .await?;
-                    if page.url == "about:blank" {
-                        anyhow::bail!(
-                            "No browser page is open. Use browser action=open with an HTTPS URL or include url on task"
-                        );
-                    }
-                }
-                self.task(&id, args).await
-            }
             "list_downloads" => Ok(serde_json::to_value(
                 self.client.list_downloads(&id).await?,
             )?),
@@ -560,8 +488,8 @@ impl BrowserTool {
                 Ok(serde_json::to_value(d)?)
             }
             _ => {
-                let action = parse_action(args)?;
-                approve_browser_action(&self.client, &id, &action, false).await?;
+                let action = direct_action(args)?;
+                approve_browser_action(&self.client, &id, &action, false, origin).await?;
                 Ok(serde_json::to_value(
                     self.client.perform(&id, action).await?,
                 )?)
@@ -570,80 +498,9 @@ impl BrowserTool {
     }
 }
 
-fn required<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Missing '{key}' parameter"))
-}
-
-fn parse_action(args: &Value) -> anyhow::Result<Action> {
-    let target = || required(args, "selector").map(Target::parse);
-    Ok(match required(args, "action")? {
-        "click" => Action::Click {
-            target: target()?,
-            new_tab: false,
-        },
-        "fill" => Action::Fill {
-            target: target()?,
-            value: required(args, "value")?.into(),
-        },
-        "type" => Action::Type {
-            target: args["selector"].as_str().map(Target::parse),
-            text: required(args, "text")?.into(),
-            delay_ms: None,
-        },
-        "get_text" => Action::GetText { target: target()? },
-        "is_visible" => Action::IsVisible { target: target()? },
-        "hover" => Action::Hover { target: target()? },
-        "press" => Action::Press {
-            key: required(args, "key")?.into(),
-        },
-        "scroll" => Action::Scroll {
-            direction: match required(args, "direction")? {
-                "up" => ScrollDirection::Up,
-                "down" => ScrollDirection::Down,
-                "left" => ScrollDirection::Left,
-                "right" => ScrollDirection::Right,
-                x => anyhow::bail!("Invalid direction: {x}"),
-            },
-            pixels: args["pixels"].as_u64().and_then(|v| u32::try_from(v).ok()),
-            target: None,
-        },
-        "wait" => Action::WaitFor {
-            target: args["selector"].as_str().map(Target::parse),
-            text: args["text"].as_str().map(str::to_owned),
-            state: WaitState::Visible,
-            ms: args["ms"].as_u64(),
-            timeout_ms: args["timeout_ms"].as_u64(),
-        },
-        "find" => {
-            let by = match required(args, "by")? {
-                "role" => LocateBy::Role,
-                "text" => LocateBy::Text,
-                "label" => LocateBy::Label,
-                "placeholder" => LocateBy::Placeholder,
-                "testid" => LocateBy::TestId,
-                x => anyhow::bail!("Invalid locator: {x}"),
-            };
-            let target = Target::locator(Locator::new(by, required(args, "value")?));
-            match required(args, "find_action")? {
-                "click" => Action::Click {
-                    target,
-                    new_tab: false,
-                },
-                "fill" => Action::Fill {
-                    target,
-                    value: required(args, "fill_value")?.into(),
-                },
-                "text" => Action::GetText { target },
-                "hover" => Action::Hover { target },
-                x => anyhow::bail!("Invalid find action: {x}"),
-            }
-        }
-        x => anyhow::bail!("Unsupported browser action: {x}"),
-    })
-}
+/// The browser tool's deadline: the approval gate's ten-minute park plus two
+/// minutes for the action itself. See `BrowserTool::timeout_policy`.
+pub(crate) const BROWSER_TOOL_TIMEOUT_MS: u64 = 12 * 60 * 1000;
 
 #[async_trait]
 impl Tool for BrowserTool {
@@ -655,50 +512,46 @@ impl Tool for BrowserTool {
     }
     fn description(&self) -> &str {
         concat!(
-            "TinyBrowser website operations. Call action=open with the starting URL in this tool ",
-            "before snapshot, read_page, or task. browser_open is a separate one-shot session. ",
+            "TinyComputer website operations. Call action=open with the starting URL in this tool ",
+            "before snapshot or read_page. browser_open is a separate one-shot session. ",
             "Then use snapshot for current ",
             "accessibility refs such as @e1 and read_page for visible prose. Refs expire after ",
             "navigation or a new snapshot; take a fresh snapshot instead of guessing a stale ref. ",
             "For multi-step work, use task with an optional starting url, an observable final-state goal, and named exact ",
-            "input values. Jev chooses among current refs and input names; it does not invent text ",
-            "to enter. Check task status, steps, and final_snapshot before claiming completion. ",
-            "DoneUnconfirmed needs direct inspection; Stuck calls for one fresh snapshot and ",
-            "diagnosis; Blocked and Budget are stopping conditions. NeedsConfirmation returns an ",
-            "exact pending action and token. Use confirm_pending only through the host approval ",
-            "mechanism for that exact action. Direct consequential clicks and key presses also ",
-            "require host approval. For downloads, inspect list_downloads and call wait_download; ",
+            "input values; TinyComputer runs it in its own browser session, and a failed step is ",
+            "handed to its rescue model before the task fails. The reply's status says what it needs: ",
+            "running (call task_continue with task_id to keep following it), needs_input (task_continue ",
+            "with inputs), needs_human (ask the user, then task_continue with answer=done), needs_approval ",
+            "(returns a pending token; use confirm_pending only through the host approval mechanism), ",
+            "checkpoint (always before payment), done, or failed with a hint. task_cancel stops it. ",
+            "Direct consequential clicks and key presses also require host approval. For downloads, inspect list_downloads and call wait_download; ",
             "success is reported only after the tracked file path and byte count are verified. ",
             "Keep the same conversation session across turns and close it when finished. Navigation ",
             "obeys the shared allowed websites list; do not try to evade a blocked destination."
         )
     }
     fn parameters_schema(&self) -> Value {
-        json!({"type":"object","properties":{
-        "action":{"type":"string","enum":["open","snapshot","read_page","click","fill","type","get_text","get_title","get_url","wait","press","hover","scroll","is_visible","find","task","confirm_pending","list_downloads","wait_download","close"]},
-        "url":{"type":"string","description":"Starting HTTPS URL for open or an optional starting URL for task"},"selector":{"type":"string"},"value":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},"direction":{"type":"string"},"pixels":{"type":"integer"},"ms":{"type":"integer"},"timeout_ms":{"type":"integer"},"interactive_only":{"type":"boolean"},"compact":{"type":"boolean"},"depth":{"type":"integer"},"by":{"type":"string"},"find_action":{"type":"string"},"fill_value":{"type":"string"},"goal":{"type":"string"},"inputs":{"type":"object","additionalProperties":{"type":"string"}},"token":{"type":"string","description":"Token returned with the exact pending action"},"pending_action":{"type":"object","description":"Exact pending action for host approval; must match the task result"}
-    },"required":["action"]})
+        tinycomputer_bus::browser::tool::parameters_schema()
+    }
+    /// Direct consequential actions park on the approval gate *inside*
+    /// `execute` (`intercept_forced`), which waits up to the gate's TTL. The
+    /// inherited 120s per-tool deadline would cut that park long before the
+    /// user can answer, so the browser carries its own budget: the longest
+    /// park plus time for the action itself.
+    fn timeout_policy(&self, _args: &Value) -> tinytools::ToolTimeout {
+        tinytools::ToolTimeout::Millis(BROWSER_TOOL_TIMEOUT_MS)
     }
     fn external_effect_with_args(&self, args: &Value) -> bool {
-        // All mutating actions, including Jev task steps, use the forced gate
-        // immediately before perform. Declaring an outer effect would park the
-        // same call twice and cannot cover the actions chosen inside `task`.
+        // Gate direct mutations before perform; task steps pause for approval.
+        // An outer effect would gate twice without covering task-selected steps.
         let _ = args;
         false
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
-            return Ok(ToolResult::error(
-                "[policy-blocked] Action blocked: autonomy is read-only",
-            ));
-        }
-        if args["action"] != "task" && !self.security.record_action() {
-            return Ok(ToolResult::error("Action blocked: rate limit exceeded"));
-        }
-        match self.run(&args).await {
-            Ok(v) => Ok(ToolResult::success(serde_json::to_string_pretty(&v)?)),
-            Err(e) => Ok(ToolResult::error(e.to_string())),
-        }
+        // Direct dispatch has no run: the turn's origin is whatever the calling
+        // task's scope carries.
+        let origin = crate::core::runtime::DispatchCtx::ambient_turn().turn_origin();
+        self.execute_with_origin(args, origin).await
     }
 
     async fn execute_with_context(
@@ -708,38 +561,36 @@ impl Tool for BrowserTool {
         context: Option<&dyn ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
         if let Some(thread_id) = context.and_then(ToolRunContext::thread_id) {
-            let key = format!(
-                "{}:{thread_id}",
-                self.client.config().workspace_dir.display()
-            );
+            let scope = crate::core::runtime::agent_scope_dir(self.client.config());
+            let key = format!("{}:{thread_id}", scope.display());
             if let Ok(mut held) = self.thread_key.lock() {
                 *held = Some(key);
             }
         }
-        self.execute(args).await
+        let origin = crate::agent::tinyagents::host::run_context::turn_origin_for_tool(context);
+        self.execute_with_origin(args, origin).await
     }
 }
 
-impl Drop for BrowserTool {
-    fn drop(&mut self) {
-        if self.thread_key.lock().ok().is_some_and(|key| key.is_some()) {
-            // A later turn in this conversation reuses the module session.
-            // Explicit `close` removes it; module shutdown owns final cleanup.
-            return;
-        }
-        if let Ok(mut held) = self.session.try_lock() {
-            if let Some(id) = held.take() {
-                let client = self.client.clone();
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        let _ = client.close_session(&id).await;
-                    });
-                }
-            }
+impl BrowserTool {
+    /// Runs the tool for a turn running under `origin` (cron, background job,
+    /// workflow, chat), the typed authority its entry point supplied.
+    async fn execute_with_origin(
+        &self,
+        args: Value,
+        origin: Option<crate::core::runtime::turn_origin::AgentTurnOrigin>,
+    ) -> anyhow::Result<ToolResult> {
+        match self.run(&args, origin.as_ref()).await {
+            Ok(v) => Ok(ToolResult::success(serde_json::to_string_pretty(&v)?)),
+            Err(e) => Ok(ToolResult::error(e.to_string())),
         }
     }
 }
 
 #[cfg(test)]
-#[path = "browser_tinybrowser_tests.rs"]
+#[path = "browser_computer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "browser_task_outcome_tests.rs"]
+mod task_outcome_tests;

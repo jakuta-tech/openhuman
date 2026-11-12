@@ -14,6 +14,84 @@ fn test_config(tmp: &TempDir) -> Config {
     }
 }
 
+#[tokio::test]
+async fn bound_session_token_release_requires_issuing_backend() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    config.api_url = Some("https://issuer.example/".into());
+    config.resolved_endpoints.control_plane_url = Some("https://issuer.example".into());
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        SESSION_ISSUING_BACKEND_META.into(),
+        "https://issuer.example".into(),
+    );
+    AuthService::from_config(&config)
+        .store_provider_token(
+            APP_SESSION_PROVIDER,
+            DEFAULT_AUTH_PROFILE_NAME,
+            "synthetic-session",
+            metadata,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        get_session_token(&config).await.unwrap().as_deref(),
+        Some("synthetic-session")
+    );
+    assert!(matches!(
+        resolve_backend_credential(&config).await.unwrap(),
+        BackendCredential::Session(_)
+    ));
+    let state = build_session_state(&config).await.unwrap();
+    assert_eq!(
+        state.issuing_backend.as_deref(),
+        Some("https://issuer.example")
+    );
+    config.api_url = Some("https://different.example".into());
+    config.resolved_endpoints.control_plane_url = Some("https://different.example".into());
+    assert!(get_session_token(&config)
+        .await
+        .unwrap_err()
+        .starts_with("SESSION_BACKEND_MISMATCH"));
+    assert!(resolve_backend_credential(&config)
+        .await
+        .unwrap_err()
+        .starts_with("SESSION_BACKEND_MISMATCH"));
+    assert!(direct_backend_credential(&config, "test").await.is_none());
+    crate::security::credentials::api_key::store_api_key(&config, "synthetic-key")
+        .await
+        .unwrap();
+    assert!(matches!(
+        resolve_backend_credential(&config).await.unwrap(),
+        BackendCredential::ApiKey(_)
+    ));
+}
+
+#[test]
+fn issuing_backend_normalizes_origin_and_rejects_url_secrets() {
+    assert_eq!(
+        normalize_session_backend("HTTPS://ISSUER.EXAMPLE:443/path/").unwrap(),
+        "https://issuer.example"
+    );
+    for invalid in [
+        "https://operator:secret@issuer.example",
+        "https://issuer.example?token=secret",
+        "https://issuer.example#secret",
+        "file:///private",
+    ] {
+        assert_eq!(
+            normalize_session_backend(invalid).unwrap_err(),
+            "invalid issuing backend"
+        );
+    }
+    let legacy: AuthStateResponse = serde_json::from_value(
+        json!({"isAuthenticated":false,"userId":null,"user":null,"profileId":null}),
+    )
+    .unwrap();
+    assert!(legacy.issuing_backend.is_none());
+}
+
 // ── profile_name_or_default ────────────────────────────────────
 
 #[test]
@@ -192,22 +270,22 @@ fn session_user_value_returns_none_for_invalid_user_json() {
 
 // ── build_session_state / get_session_token ────────────────────
 
-#[test]
-fn build_session_state_returns_unauthenticated_when_store_is_empty() {
+#[tokio::test]
+async fn build_session_state_returns_unauthenticated_when_store_is_empty() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
-    let state = build_session_state(&config).expect("state");
+    let state = build_session_state(&config).await.expect("state");
     assert!(!state.is_authenticated);
     assert!(state.user_id.is_none());
     assert!(state.user.is_none());
     assert!(state.profile_id.is_none());
 }
 
-#[test]
-fn get_session_token_returns_none_when_store_is_empty() {
+#[tokio::test]
+async fn get_session_token_returns_none_when_store_is_empty() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
-    assert!(get_session_token(&config).unwrap().is_none());
+    assert!(get_session_token(&config).await.unwrap().is_none());
 }
 
 /// Regression for CodeRabbit feedback on PR #2085: a profile whose
@@ -233,8 +311,8 @@ fn session_token_from_profile_normalises_blank_tokens_to_none() {
     );
 }
 
-#[test]
-fn get_session_token_returns_stored_token_when_present() {
+#[tokio::test]
+async fn get_session_token_returns_stored_token_when_present() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
     let service = AuthService::from_config(&config);
@@ -246,18 +324,53 @@ fn get_session_token_returns_stored_token_when_present() {
             std::collections::HashMap::new(),
             true,
         )
+        .await
         .expect("store token");
     assert_eq!(
-        get_session_token(&config).unwrap().as_deref(),
+        get_session_token(&config).await.unwrap().as_deref(),
         Some("raw-session-token")
     );
-    let state = build_session_state(&config).unwrap();
+    let state = build_session_state(&config).await.unwrap();
     assert!(state.is_authenticated);
     assert!(state.profile_id.is_some());
 }
 
-#[test]
-fn offline_local_token_is_never_a_backend_bearer() {
+#[tokio::test]
+async fn backend_bearer_secret_prefers_api_key_and_returns_none_when_empty() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    assert_eq!(backend_bearer_secret(&config).await.unwrap(), None);
+    crate::security::credentials::api_key::store_api_key(&config, "th_test_key")
+        .await
+        .expect("store API key");
+    assert_eq!(
+        backend_bearer_secret(&config).await.unwrap().as_deref(),
+        Some("th_test_key")
+    );
+}
+
+#[tokio::test]
+async fn backend_bearer_secret_falls_back_to_session_token() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    AuthService::from_config(&config)
+        .store_provider_token(
+            APP_SESSION_PROVIDER,
+            DEFAULT_AUTH_PROFILE_NAME,
+            "raw-session-token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store session token");
+    assert_eq!(
+        backend_bearer_secret(&config).await.unwrap().as_deref(),
+        Some("raw-session-token")
+    );
+}
+
+#[tokio::test]
+async fn offline_local_token_is_never_a_backend_bearer() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
     AuthService::from_config(&config)
@@ -268,9 +381,19 @@ fn offline_local_token_is_never_a_backend_bearer() {
             std::collections::HashMap::new(),
             true,
         )
+        .await
         .unwrap();
-    let error = resolve_backend_credential(&config).unwrap_err();
-    assert_eq!(error, "backend unavailable for offline local session");
+    let error = resolve_backend_credential(&config).await.unwrap_err();
+    assert_eq!(error, LOCAL_SESSION_BACKEND_UNAVAILABLE);
+    assert!(crate::core::observability::is_backend_unavailable_message(
+        &error
+    ));
+    // Regression (Sentry 36649): the local-session refusal must classify as
+    // expected, not reach Sentry as an `rpc.invoke_method` error.
+    assert!(matches!(
+        crate::core::observability::expected_error_kind(&error),
+        Some(crate::core::observability::ExpectedErrorKind::BackendUnavailable)
+    ));
 }
 
 /// Regression: when both an app-session profile and a stored API key are
@@ -278,8 +401,8 @@ fn offline_local_token_is_never_a_backend_bearer() {
 /// `resolve_backend_credential`'s precedence — every backend request the
 /// runtime actually makes authenticates with the key, not the session, so
 /// the state must not misidentify which credential is live.
-#[test]
-fn build_session_state_prefers_the_api_key_over_a_present_session() {
+#[tokio::test]
+async fn build_session_state_prefers_the_api_key_over_a_present_session() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(&tmp);
     let service = AuthService::from_config(&config);
@@ -293,11 +416,13 @@ fn build_session_state_prefers_the_api_key_over_a_present_session() {
             session_meta,
             true,
         )
+        .await
         .expect("store session token");
     crate::security::credentials::api_key::store_api_key(&config, "th_test_key")
+        .await
         .expect("store api key");
 
-    let state = build_session_state(&config).unwrap();
+    let state = build_session_state(&config).await.unwrap();
     assert!(state.is_authenticated);
     assert_eq!(
         state.credential.as_deref(),
@@ -380,5 +505,50 @@ fn classify_expired_within_skew_window() {
     assert_eq!(
         classify_session_token(Some(&p), now),
         SessionTokenCheck::Expired
+    );
+}
+
+// ── direct_backend_credential ──────────────────────────────────
+
+#[tokio::test]
+async fn direct_backend_credential_skips_without_a_usable_credential() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    // Signed out: nothing to authenticate a direct backend call with.
+    assert!(direct_backend_credential(&config, "test").await.is_none());
+
+    // The offline local session has no TinyHumans account (Sentry 36649).
+    AuthService::from_config(&config)
+        .store_provider_token(
+            APP_SESSION_PROVIDER,
+            DEFAULT_AUTH_PROFILE_NAME,
+            "desktop.test.local",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(direct_backend_credential(&config, "test").await.is_none());
+}
+
+#[tokio::test]
+async fn direct_backend_credential_returns_a_live_session() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    AuthService::from_config(&config)
+        .store_provider_token(
+            APP_SESSION_PROVIDER,
+            DEFAULT_AUTH_PROFILE_NAME,
+            "raw-session-token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+    // The gate is "a control plane was resolved onto the config".
+    config.resolved_endpoints.control_plane_url = Some("https://api.example.test".into());
+    assert_eq!(
+        direct_backend_credential(&config, "test").await,
+        Some(BackendCredential::Session("raw-session-token".into()))
     );
 }

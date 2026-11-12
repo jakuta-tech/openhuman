@@ -1,32 +1,26 @@
 //! [`TurnContextMiddleware`]: the per-turn config bundle that installs the
-//! context middlewares, plus the small observation/handoff hooks it owns
-//! (transcript snapshot, progressive-disclosure handoff).
+//! context middlewares, plus the small observation hook it owns (transcript
+//! snapshot).
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 
 use tinyagents_harness::context::RunContext;
 use tinyagents_harness::error::Result as TaResult;
-use tinyagents_harness::middleware::{Middleware, ToolInvocationIdentity};
+use tinyagents_harness::middleware::Middleware;
 use tinyagents_harness::runtime::AgentHarness;
 use tinyinference_llm::message::Message;
 use tinyinference_llm::model::{ModelRequest, ModelResponse, ResolvedModelRoute};
 use tinytools::{ToolPolicy as TaToolPolicy, ToolResult as TaToolResult};
 
-use crate::agent::harness::tool_result_artifacts::ToolResultArtifactStore;
-use crate::agent::tinyagents::payload_summarizer::PayloadSummarizer;
-use crate::agent::tinyagents::turn_outcome::ToolCallOutcome;
-use crate::inference::tokenjuice::AgentTokenjuiceCompression;
+use crate::agent::harness::tool_result_artifacts::HostArtifactStore;
+use crate::agent::tinyagents::payload_summarizer::DynPayloadSummarizer;
+use tinyagents_harness::turn_outcome::ToolCallOutcome;
+use tinyjuice_bus::types::AgentTokenjuiceCompression;
 
 use super::tool_output::ToolOutputMiddleware;
-
-/// Default per-tool-result byte cap for the channel / sub-agent paths, which do
-/// not carry a session `ContextManager` to source the configured budget from.
-/// Mirrors the `ContextConfig::tool_result_budget_bytes` default (16 KiB).
-pub(crate) const DEFAULT_TOOL_RESULT_BUDGET_BYTES: usize = 16 * 1024;
 
 /// Config bundle for the openhuman context middlewares installed on a turn.
 ///
@@ -37,9 +31,9 @@ pub(crate) struct TurnContextMiddleware {
     /// Per-tool-result byte cap. `0` disables the cap.
     pub(crate) tool_result_budget_bytes: usize,
     /// The model behind TinyJuice's tool-output summary. `None` disables it.
-    pub(crate) payload_summarizer: Option<Arc<dyn PayloadSummarizer>>,
+    pub(crate) payload_summarizer: Option<Arc<DynPayloadSummarizer>>,
     /// Optional action-workspace artifact sink for oversized tool results.
-    pub(crate) artifact_store: Option<ToolResultArtifactStore>,
+    pub(crate) artifact_store: Option<HostArtifactStore>,
     /// Whether TokenJuice content-aware compaction runs before output caps.
     pub(crate) tokenjuice_compaction_enabled: bool,
     /// Agent-level TokenJuice profile for tool-result compaction.
@@ -55,11 +49,14 @@ pub(crate) struct TurnContextMiddleware {
     /// summarizer tokens or rewrite history. The deterministic hard-trim backstop
     /// still installs regardless. Defaults to `true` (see [`defaults`](Self::defaults)).
     pub(crate) autocompact_enabled: bool,
-    /// Progressive-disclosure handoff: when set (integrations_agent with a
-    /// resolved toolkit), oversized tool results are stashed in the shared
-    /// [`ResultHandoffCache`] and replaced with an `extract_from_result` drill-in
-    /// placeholder. `None` everywhere else.
-    pub(crate) handoff: Option<HandoffConfig>,
+    /// `[context].compaction_trigger_tokens` and `compaction_strategy`: the
+    /// absolute compaction trigger override (installing compaction even when
+    /// the window is unknown; `None` keeps the window-relative default) and
+    /// how a compaction writes its checkpoint.
+    pub(crate) compaction: crate::config::CompactionSettings,
+    /// `[context].keep_recent_tokens`: the verbatim tail an in-turn compaction
+    /// keeps. `None` keeps the strategy's own default.
+    pub(crate) keep_recent_tokens: Option<u64>,
     /// Live transcript snapshot sink (#4466). When set, a
     /// [`TranscriptSnapshotMiddleware`] mirrors the running conversation into
     /// this shared buffer before every model call, so an erroring run can still
@@ -91,9 +88,15 @@ pub(crate) struct TranscriptSnapshot {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) cached_input_tokens: u64,
-    /// Provider-reported cost where available, otherwise the host's per-call
-    /// estimate. This covers only model calls the provider answered.
-    pub(crate) charged_amount_usd: f64,
+    /// Input and output tokens of the newest answered call alone. The fields
+    /// above sum every call, so they measure spend; these measure how full the
+    /// context window was, which is what the context gauge shows.
+    pub(crate) last_call_input_tokens: u64,
+    pub(crate) last_call_output_tokens: u64,
+    /// Cost of the model calls the provider answered: each call's reported
+    /// charge, else its catalog estimate, else unknown (see
+    /// [`crate::agent::cost::call_cost`]).
+    pub(crate) cost: tinyagents_harness::cost::CostTally,
     /// The last accepted model route. A failed follow-up has no response of
     /// its own, so this remains the route that incurred the snapshot usage.
     pub(crate) resolved_route: Option<ResolvedModelRoute>,
@@ -174,11 +177,32 @@ pub(crate) type TranscriptSnapshotSink = Arc<std::sync::Mutex<TranscriptSnapshot
 /// failure.
 pub(crate) struct TranscriptSnapshotMiddleware {
     sink: TranscriptSnapshotSink,
-    /// `after_tool` receives no structured arguments or start time. Keep both
-    /// while the harness still exposes the concrete call so an erroring run can
-    /// hand the same honest tool result to the durable partial append as a
-    /// completed run does.
-    started: Arc<std::sync::Mutex<HashMap<String, (Instant, serde_json::Value)>>>,
+    /// TinyAgents owns request acceptance, transcript replay, call timing and
+    /// tool outcome capture. OpenHuman mirrors that snapshot while adding the
+    /// pricing data the owner intentionally does not know about.
+    owner_sink: tinyagents_harness::middleware::library::TranscriptSnapshotSink,
+    owner: tinyagents_harness::middleware::library::TranscriptSnapshotMiddleware,
+}
+
+fn sync_owner_snapshot(
+    owner: &tinyagents_harness::middleware::library::TranscriptSnapshotSink,
+    host: &TranscriptSnapshotSink,
+) {
+    let Some(snapshot) = owner.lock().ok().map(|snapshot| snapshot.clone()) else {
+        return;
+    };
+    if let Ok(mut host) = host.lock() {
+        host.messages = snapshot.messages;
+        host.accepted_len = snapshot.accepted_len;
+        host.request_base_len = snapshot.request_base_len;
+        host.input_tokens = snapshot.input_tokens;
+        host.output_tokens = snapshot.output_tokens;
+        host.cached_input_tokens = snapshot.cached_input_tokens;
+        host.last_call_input_tokens = snapshot.last_call_input_tokens;
+        host.last_call_output_tokens = snapshot.last_call_output_tokens;
+        host.model_calls = snapshot.model_calls;
+        host.tool_outcomes = snapshot.tool_outcomes;
+    }
 }
 
 #[async_trait]
@@ -191,76 +215,48 @@ impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
 
     async fn before_tool(
         &self,
-        _ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
-        _state: &(),
+        ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
+        state: &(),
         call: &mut tinyinference_llm::tool::ToolCall,
     ) -> TaResult<()> {
-        if let Ok(mut started) = self.started.lock() {
-            started.insert(
-                call.id.to_string(),
-                (Instant::now(), call.arguments.clone()),
-            );
-        }
-        Ok(())
+        self.owner.before_tool(ctx, state, call).await
     }
 
     async fn after_tool(
         &self,
-        _ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
-        _state: &(),
-        invocation: &ToolInvocationIdentity,
+        ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
+        state: &(),
+        invocation: &tinyagents_harness::middleware::ToolInvocationIdentity,
         result: &mut TaToolResult,
     ) -> TaResult<()> {
-        // A tool result reaches a provider only with the next request, so it
-        // also sits past `accepted_len` until that request is answered.
-        let call_id = invocation.call_id().to_string();
-        let (duration_ms, arguments) = self
-            .started
-            .lock()
-            .ok()
-            .and_then(|mut started| started.remove(&call_id))
-            .map(|(started, arguments)| {
-                (
-                    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                    arguments,
-                )
-            })
-            .unwrap_or_default();
-        let content = crate::agent::tinyagents::middleware::tool_result_text(result);
-        if let Ok(mut guard) = self.sink.lock() {
-            guard
-                .messages
-                .push(Message::tool(call_id.clone(), content.clone()));
-            guard.tool_outcomes.push(ToolCallOutcome {
-                call_id,
-                name: invocation.tool_name().to_string(),
-                arguments,
-                success: !result.is_error,
-                content,
-                duration_ms,
-            });
-        }
+        self.owner
+            .after_tool(ctx, state, invocation, result)
+            .await?;
+        sync_owner_snapshot(&self.owner_sink, &self.sink);
         Ok(())
     }
 
-    async fn before_model(
+    async fn before_model_dispatch(
         &self,
-        _ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
-        _state: &(),
+        ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
+        state: &(),
         request: &mut ModelRequest,
     ) -> TaResult<()> {
-        if let Ok(mut guard) = self.sink.lock() {
-            guard.messages = request.messages.clone();
-        }
+        self.owner
+            .before_model_dispatch(ctx, state, request)
+            .await?;
+        sync_owner_snapshot(&self.owner_sink, &self.sink);
         Ok(())
     }
 
     async fn after_model(
         &self,
         ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
-        _state: &(),
+        state: &(),
         response: &mut ModelResponse,
     ) -> TaResult<()> {
+        self.owner.after_model(ctx, state, response).await?;
+        sync_owner_snapshot(&self.owner_sink, &self.sink);
         // The model middleware records this same route in the host context.
         // Prefer response metadata because it is the exact accepted call; the
         // context slot is the compatibility seam for a model wrapper that only
@@ -273,35 +269,22 @@ impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
                 .clone()
         });
         if let Ok(mut guard) = self.sink.lock() {
-            guard.accepted_len = guard.messages.len();
-            guard.model_calls += 1;
-            // The response has not been sent back to a provider yet, so it sits
-            // past `accepted_len`; an error before the next request still keeps
-            // it, as text.
-            guard
-                .messages
-                .push(Message::Assistant(response.message.clone()));
             // A cache replay consumed no provider tokens.
             if let Some(usage) = response
                 .usage
                 .as_ref()
                 .filter(|_| !response.served_from_cache)
             {
-                guard.input_tokens += usage.input_tokens;
-                guard.output_tokens += usage.output_tokens;
-                guard.cached_input_tokens += usage.cache_read_tokens;
-                let host_usage = crate::agent::tinyagents::model::usage_info_from_response(
-                    response,
-                )
-                .unwrap_or(crate::inference::provider::UsageInfo {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    context_window: 0,
-                    cached_input_tokens: usage.cache_read_tokens,
-                    cache_creation_tokens: usage.cache_creation_tokens,
-                    reasoning_tokens: usage.reasoning_tokens,
-                    charged_amount_usd: 0.0,
-                });
+                let host_usage = tinyinference_llm::usage::usage_info_from_response(response)
+                    .unwrap_or(
+                        tinyinference_llm::usage::BilledUsage::from_counts(
+                            usage.input_tokens,
+                            usage.output_tokens,
+                        )
+                        .with_cached_input_tokens(usage.cache_read_tokens)
+                        .with_cache_creation_tokens(usage.cache_creation_tokens)
+                        .with_reasoning_tokens(usage.reasoning_tokens),
+                    );
                 // Use the host's per-call pricing helper whenever the provider
                 // omitted an authoritative amount. `route` is preferred over a
                 // construction-time model because it preserves fallback pricing.
@@ -316,8 +299,13 @@ impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
                     })
                     .or(guard.pricing_model.as_deref())
                     .unwrap_or_default();
-                guard.charged_amount_usd +=
-                    crate::agent::cost::call_cost_usd(cost_model, &host_usage);
+                let call_cost = crate::agent::cost::call_cost(cost_model, &host_usage);
+                tracing::debug!(
+                    model = cost_model,
+                    ?call_cost,
+                    "[cost] per-call cost (charged, catalog estimate, or unknown)"
+                );
+                guard.cost.add(call_cost);
             }
             if route.is_some() {
                 guard.resolved_route = route;
@@ -325,45 +313,58 @@ impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
         }
         Ok(())
     }
-}
 
-/// Config for the [`HandoffMiddleware`]: the per-spawn cache (shared with the
-/// `extract_from_result` tool) plus the ids used in handoff log lines.
-#[derive(Clone)]
-pub(crate) struct HandoffConfig {
-    pub(crate) cache: Arc<crate::agent::subagent_host::ResultHandoffCache>,
-    pub(crate) agent_id: String,
-    pub(crate) task_id: String,
+    async fn after_agent(
+        &self,
+        ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
+        state: &(),
+        run: &mut tinyagents_harness::middleware::AgentRun,
+    ) -> TaResult<()> {
+        self.owner.after_agent(ctx, state, run).await
+    }
+
+    async fn on_error(
+        &self,
+        ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
+        error: &tinyagents_harness::error::TinyAgentsError,
+    ) -> TaResult<()> {
+        <tinyagents_harness::middleware::library::TranscriptSnapshotMiddleware as Middleware<
+            (),
+            crate::agent::tinyagents::host::OpenHumanRunContext,
+        >>::on_error(&self.owner, ctx, error)
+        .await
+    }
 }
 
 impl TurnContextMiddleware {
-    /// A sensible default for turn paths without a session `ContextManager`
+    /// A sensible default for turn paths without session-specific context settings
     /// (channel / sub-agent): the default tool-result byte cap, no summarizer or
     /// microcompact.
     pub(crate) fn defaults() -> Self {
         Self {
-            tool_result_budget_bytes: DEFAULT_TOOL_RESULT_BUDGET_BYTES,
+            tool_result_budget_bytes: tinyagents_harness::config::TurnConfig::default()
+                .tool_result_budget_bytes,
             payload_summarizer: None,
             // Deliberately `None` on the channel / sub-agent path (#6408).
             //
             // This constructor has no session context, so it has no
-            // `action_dir` to root the store at. Handing it any other directory
-            // would write artifacts the model cannot read back:
-            // `artifact_read_target` only recognises a `file_read` under the
-            // action workspace's `artifacts/tool-results/…`, so an artifact
-            // written elsewhere yields a pointer that resolves to nothing —
-            // strictly worse than the inline truncation it replaced, which at
-            // least returns the head. Sub-agent turns therefore keep today's
-            // truncation until a real `action_dir` is threaded through here.
-            // Tracked as #6483 — delegated turns are where oversized results are
-            // most likely, so this gap is not cosmetic.
+            // `workspace_dir` to put the store under, and any directory it
+            // guessed could be the user's project: oversized outputs would
+            // become stray files there. The store is detached now (absolute
+            // pointers under `<workspace_dir>/artifacts/tool-results`), so the
+            // read side no longer constrains where it lives; what is missing
+            // is only that path. Sub-agent turns keep inline truncation until
+            // `workspace_dir` is threaded through here. Tracked as #6483 —
+            // delegated turns are where oversized results are most likely, so
+            // this gap is not cosmetic.
             artifact_store: None,
             tokenjuice_compaction_enabled: false,
             tokenjuice_compression: AgentTokenjuiceCompression::Off,
             runtime_config: None,
             microcompact_keep_recent: 0,
             autocompact_enabled: true,
-            handoff: None,
+            compaction: Default::default(),
+            keep_recent_tokens: None,
             transcript_snapshot: None,
         }
     }
@@ -374,7 +375,6 @@ impl TurnContextMiddleware {
             && self.payload_summarizer.is_none()
             && !self.tokenjuice_compaction_enabled
             && self.microcompact_keep_recent == 0
-            && self.handoff.is_none()
             && self.transcript_snapshot.is_none()
     }
 
@@ -390,14 +390,24 @@ impl TurnContextMiddleware {
         tool_policies: HashMap<String, TaToolPolicy>,
         summary_focus_tools: std::collections::HashSet<String>,
     ) {
-        // Transcript snapshot (#4466) runs first among before_model hooks so it
-        // mirrors the *incoming* request transcript (every prior completed round)
-        // before microcompact/summarization rewrite it — the caller's error path
-        // persists exactly what the model was about to see.
+        harness.push_middleware(Arc::new(AttachmentRequestScopeMiddleware));
+        // Dispatch observers run before model-control/rewrite hooks. Snapshot
+        // before the ephemeral-instruction injector so corrections reach the
+        // provider without entering the durable failure transcript (#6725).
+        // This also mirrors the incoming transcript before compaction/trim, so
+        // the caller's error path persists the completed rounds faithfully.
         if let Some(sink) = self.transcript_snapshot {
+            let owner_sink =
+                tinyagents_harness::middleware::library::new_transcript_snapshot_sink();
+            if let (Ok(host), Ok(mut owner)) = (sink.lock(), owner_sink.lock()) {
+                owner.request_base_len = host.request_base_len;
+            }
             harness.push_middleware(Arc::new(TranscriptSnapshotMiddleware {
                 sink,
-                started: Default::default(),
+                owner: tinyagents_harness::middleware::library::TranscriptSnapshotMiddleware::new(
+                    owner_sink.clone(),
+                ),
+                owner_sink,
             }));
         }
         // Microcompact is NOT registered here any more (issue #6014). It used to
@@ -407,16 +417,7 @@ impl TurnContextMiddleware {
         // `CLEARED_PLACEHOLDER` and it was summarizing placeholders. The one
         // component able to preserve those results in condensed form never saw
         // them. The caller now sites it AFTER compression, so the ladder reads
-        // summarize → blank → evict. See `assemble_turn_harness`.
-        // REVERSE-ORDER RULE (issue #4464): the crate runs `after_tool` hooks in
-        // REVERSE registration order (`MiddlewareStack::run_after_tool` iterates
-        // `self.middlewares.iter().rev()`, tinyagents src/harness/middleware/mod.rs).
-        // So the LAST-pushed middleware's `after_tool` runs FIRST. To make the
-        // effective `after_tool` chain be handoff(raw) → tool-output budget/caps,
-        // the handoff MUST be pushed AFTER the tool-output budget.
-        //
-        // Push the tool-output budget FIRST (so its `after_tool` runs SECOND):
-        // it truncates the oversized payload to the 16 KiB byte cap.
+        // summarize → blank → evict. See `install_turn_middleware`.
         if self.tool_result_budget_bytes > 0
             || self.payload_summarizer.is_some()
             || self.tokenjuice_compaction_enabled
@@ -433,107 +434,36 @@ impl TurnContextMiddleware {
                 focus_by_call: Default::default(),
                 summary_focus_tools,
                 raw_fetches: Default::default(),
+                file_reads: Default::default(),
             }));
         }
-        // Push the handoff LAST (so its `after_tool` runs FIRST): it observes the
-        // RAW, uncapped payload, stashes an oversized result into the
-        // `ResultHandoffCache`, and swaps in a short pointer BEFORE the tool-output
-        // budget can shrink it below the 50k-token handoff threshold and defeat the
-        // drill-in.
-        if let Some(handoff) = self.handoff {
-            harness.push_middleware(Arc::new(HandoffMiddleware::new(handoff)));
-        }
     }
 }
 
-/// `after_tool`: progressive-disclosure handoff (issue #4249 1b). An oversized
-/// sub-agent tool result is stashed in the shared [`ResultHandoffCache`] and its
-/// content replaced with a short placeholder naming a `result_id` the model can
-/// drill into via `extract_from_result`. Restores the seam the legacy
-/// `SubagentToolSource` ran on every tool result (via `apply_handoff`), which the
-/// agent_graph rewrite dropped. Errors and `extract_from_result`'s own output
-/// pass through unchanged (handled inside `apply_handoff`).
-///
-/// A read of a persisted tool-result artifact also passes through: this hook
-/// runs before `ToolOutputMiddleware`'s, so stashing the read here would hand
-/// the artifact pager a short `extract_from_result` pointer instead of the
-/// bytes the model asked for (#6284).
-pub(crate) struct HandoffMiddleware {
-    cache: Arc<crate::agent::subagent_host::ResultHandoffCache>,
-    agent_id: String,
-    task_id: String,
-    /// Call ids of artifact reads, recorded in `before_tool` (where the
-    /// arguments are visible) and consumed in `after_tool`.
-    artifact_reads: std::sync::Mutex<std::collections::HashSet<String>>,
-}
-
-impl HandoffMiddleware {
-    pub(crate) fn new(config: HandoffConfig) -> Self {
-        Self {
-            cache: config.cache,
-            agent_id: config.agent_id,
-            task_id: config.task_id,
-            artifact_reads: Default::default(),
-        }
-    }
-}
+/// Carry attachment authority over the `ChatModel<()>` seam for this request.
+/// The OpenHuman provider wrapper consumes and removes the metadata before the
+/// request reaches any provider or transcript store.
+struct AttachmentRequestScopeMiddleware;
 
 #[async_trait]
-impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext> for HandoffMiddleware {
+impl Middleware<(), crate::agent::tinyagents::host::OpenHumanRunContext>
+    for AttachmentRequestScopeMiddleware
+{
     fn name(&self) -> &str {
-        "result_handoff"
+        "attachment_request_scope"
     }
 
-    async fn before_tool(
-        &self,
-        _ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
-        _state: &(),
-        call: &mut tinyinference_llm::tool::ToolCall,
-    ) -> TaResult<()> {
-        if crate::agent::harness::tool_result_artifacts::artifact_read_target(
-            &call.name,
-            &call.arguments,
-        )
-        .is_some()
-        {
-            if let Ok(mut reads) = self.artifact_reads.lock() {
-                reads.insert(call.id.clone());
-            }
-        }
-        Ok(())
+    fn is_observer(&self) -> bool {
+        true
     }
 
-    async fn after_tool(
+    async fn before_model(
         &self,
-        _ctx: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
+        context: &mut RunContext<crate::agent::tinyagents::host::OpenHumanRunContext>,
         _state: &(),
-        invocation: &ToolInvocationIdentity,
-        result: &mut TaToolResult,
+        request: &mut ModelRequest,
     ) -> TaResult<()> {
-        let tool_name = invocation.tool_name();
-        let call_id = invocation.call_id().to_string();
-        let artifact_read = self
-            .artifact_reads
-            .lock()
-            .map(|mut reads| reads.remove(&call_id))
-            .unwrap_or(false);
-        if artifact_read {
-            tracing::debug!(
-                tool = tool_name,
-                call_id = %call_id,
-                task_id = %self.task_id,
-                "[tinyagents::mw] artifact read: skipping result handoff so the artifact pager sees the bytes"
-            );
-            return Ok(());
-        }
-        let handoff = crate::agent::subagent_host::apply_handoff(
-            &self.cache,
-            tool_name,
-            &self.task_id,
-            &self.agent_id,
-            crate::agent::tinyagents::middleware::tool_result_text(result),
-        );
-        crate::agent::tinyagents::middleware::replace_tool_result_text(result, handoff);
+        crate::attachments::attach_request_scope(request, &context.data);
         Ok(())
     }
 }

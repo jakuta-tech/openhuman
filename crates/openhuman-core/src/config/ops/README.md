@@ -3,37 +3,39 @@
 JSON-RPC / CLI controller surface for persisted config and runtime flags: the
 mutation half of `config`. `crate::config` re-exports this module both under
 its own name and as `rpc` (`pub use ops as rpc`), so most callers write
-`config::rpc::*`. Controllers in `../schemas/` are thin wrappers around the
-functions here: they deserialize RPC params into `../schemas/helpers.rs`
+`config::rpc::*`. Controllers in [`../schemas/`](../schemas/) are thin wrappers around the
+functions here: they deserialize RPC params into [`../schemas/helpers.rs`](../schemas/helpers.rs)
 `*SettingsUpdate` structs, map those field-by-field onto the `*SettingsPatch`
 structs defined here, and call the corresponding `load_and_apply_*` / `get_*`
-fn, which returns `RpcOutcome<T>`.
+fn, which returns `Outcome<T>`.
 
 ## Layout
 
 | File | Responsibility |
 | --- | --- |
-| `agent.rs` | Autonomy, agent, agent-paths, and memory-sync settings. |
-| `loader.rs` | Config loading/snapshotting and runtime flags; split into submodules `loader/load.rs`, `loader/paths.rs`, `loader/reset_local_data.rs`, `loader/runtime_flags.rs`, `loader/snapshot.rs`. |
-| `model.rs` | AI-provider, memory, runtime, local-AI, and Composio-trigger settings. |
-| `privacy.rs` | Privacy Mode (`[privacy]`) get/set. |
-| `sandbox.rs` | Sandbox / Docker runtime (`[sandbox]`, `[runtime.docker]`) settings. |
-| `ui.rs` | Browser, analytics, search, dictation, voice-server, and onboarding-flag settings. |
+| [`agent.rs`](./agent.rs) | Autonomy, agent, agent-paths, and memory-sync settings. |
+| [`cloud_providers.rs`](./cloud_providers.rs) | Cloud-provider RPC input conversion and validation. |
+| [`loader.rs`](./loader.rs) | Config loading/snapshotting and runtime flags; split into submodules [`loader/load.rs`](./loader/load.rs), [`loader/paths.rs`](./loader/paths.rs), [`loader/reset_local_data.rs`](./loader/reset_local_data.rs), [`loader/runtime_flags.rs`](./loader/runtime_flags.rs), [`loader/snapshot.rs`](./loader/snapshot.rs). |
+| [`model.rs`](./model.rs) | AI-provider, memory, runtime, local-AI, and Composio-trigger settings. |
+| [`primary_cloud.rs`](./primary_cloud.rs) | Primary cloud selection and legacy direct-inference compatibility. |
+| [`privacy.rs`](./privacy.rs) | Privacy Mode (`[privacy]`) get/set. |
+| [`sandbox.rs`](./sandbox.rs) | Sandbox / Docker runtime (`[sandbox]`, `[runtime.docker]`) settings. |
+| [`ui.rs`](./ui.rs) | Browser, analytics, and onboarding-flag settings. |
+| [`search.rs`](./search.rs) | Search settings: providers, routes, role order, keys, limits, and the web-access allowlist. |
 
 Each submodule follows the same shape: a `*SettingsPatch` struct with
 `Option<T>` fields (`None` = unchanged); an `apply_*(&mut Config, patch)` fn
 that mutates the given config, calls `Config::save()`, and returns the
 settings or snapshot; a `load_and_apply_*(patch)` wrapper that calls
 `load_config_with_timeout` first; and a `get_*` fn that reads the relevant
-section back out, usually as `RpcOutcome<serde_json::Value>`. `ui.rs`'s
-dictation and voice-server mutators exist only in `load_and_apply_*` form.
+section back out, usually as `Outcome<serde_json::Value>`. `ui.rs`'s
 
 ## Key entry points
 
 - `agent.rs`: `apply_autonomy_settings` / `get_autonomy_settings`,
   `add_auto_approve_tool`, `apply_agent_settings` / `get_agent_settings`,
   `apply_agent_paths_settings` / `get_agent_paths`, `ensure_usable_cwd`,
-  `expand_tilde`, `redact_home`, `apply_memory_sync_settings`.
+  `expand_tilde`, `redact_home`.
 - `loader.rs`: `load_config_with_timeout`,
   `load_config_for_workspace_with_timeout`, `get_config_snapshot`,
   `client_config_json`, `reload_config_from_paths`, `reset_local_data`,
@@ -41,31 +43,36 @@ dictation and voice-server mutators exist only in `load_and_apply_*` form.
   `core_rpc_url_from_env`, `agent_server_status`, `get_dashboard_settings`.
   `BROWSER_ALLOW_ALL_ENV` (`OPENHUMAN_BROWSER_ALLOW_ALL`) and
   `BROWSER_ALLOW_ALL_RPC_ENABLE_ENV` are `pub(crate)` constants re-exported
-  from `mod.rs` only under `#[cfg(test)]`.
+  from [`mod.rs`](./mod.rs) only under `#[cfg(test)]`.
 - `model.rs`: `apply_model_settings`, `apply_memory_settings`,
   `apply_runtime_settings`, `apply_local_ai_settings`,
   `apply_composio_trigger_settings`, `load_and_resolve_api_url`.
+- `cloud_providers.rs`: `build_cloud_provider_creds` converts settings RPC
+  inputs into validated cloud-provider config entries.
+- `primary_cloud.rs`: primary cloud selection and matching legacy
+  `inference_url` compatibility used by inference routing and credentials.
 - `privacy.rs`: `apply_privacy_settings`, `get_privacy_mode`.
 - `sandbox.rs`: `apply_sandbox_settings`, `get_sandbox_settings`.
+- `search.rs`: `apply_search_settings` / `get_search_settings`,
+  `search_settings_json`.
 - `ui.rs`: `apply_browser_settings`, `apply_analytics_settings`,
-  `apply_search_settings` / `get_search_settings`,
-  `load_and_apply_voice_server_settings` / `get_voice_server_settings`,
-  `load_and_apply_dictation_settings` / `get_dictation_settings`,
   `set_onboarding_completed` / `get_onboarding_completed`,
   `workspace_onboarding_flag_exists` / `workspace_onboarding_flag_set` /
   `workspace_onboarding_flag_resolve`.
 
 ## Search settings
 
-`apply_search_settings` accepts a global `enabled` switch, an explicit
-`enabled_providers` set, a presentation mode (`all_tools`, `router`, or
-`one_provider`), and direct/backend routes for Parallel and Gemini. Omitting
-`enabled_providers` migrates from saved keys, a current backend credential,
-and the separate TinyFish, Seltz, and SearXNG toggles. An explicit empty list
-selects no providers. The old `engine = "disabled"` setting still disables
-search. Both `get_search_settings` and the update response report only key
-presence booleans, never raw credentials. After saving, an already loaded
-TinySearch module is refreshed with a private configuration payload.
+`apply_search_settings` validates the whole patch before saving: a global
+`enabled` switch; per-provider `{enabled, route, api_key, base_url}` (routes a
+provider does not support are rejected, an empty key clears it); per-role
+provider order (`search`, `answer`, `contents`; a provider that cannot serve a
+role is rejected, an empty list restores the default); presentation; limits;
+and the web-access allowlist. The legacy `engine` field from older clients is
+still accepted (`SearchConfig::apply_legacy_engine`). The response and
+`get_search_settings` return the same view: each provider's resolved route,
+key presence, `usable` and status, the configured role order, and
+`effective_roles` (what serves each role right now). Keys are never returned.
+After saving, a loaded TinySearch module is refreshed privately.
 
 ## Security-relevant behavior
 
@@ -102,3 +109,9 @@ TinySearch module is refreshed with a private configuration payload.
 `ops_model_and_local_ai_tests.rs`, `ops_voice_and_autonomy_tests.rs`) can reach
 them through `use super::*`; they carry no runtime meaning outside test
 builds.
+
+## Further reading
+
+- [Parent module README](../README.md)
+- [Settings](../../../../../docs/gitbooks/en/features/settings.md)
+- [Deep architecture reference](../../../../../docs/gitbooks/en/developing/architecture.md)

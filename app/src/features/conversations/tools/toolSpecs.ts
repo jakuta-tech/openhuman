@@ -63,16 +63,13 @@ import {
   MailXIcon,
   MapPinIcon,
   MessageCircleQuestionIcon,
-  MessageSquareReplyIcon,
   MousePointerClickIcon,
   NetworkIcon,
   NewspaperIcon,
   PackageIcon,
   PackagePlusIcon,
   PackageSearchIcon,
-  PhoneIcon,
   PlugIcon,
-  PodcastIcon,
   PowerIcon,
   PresentationIcon,
   ReceiptIcon,
@@ -92,7 +89,6 @@ import {
   TextSearchIcon,
   TrendingUpIcon,
   UserRoundIcon,
-  UsersIcon,
   VideoIcon,
   WalletIcon,
   WorkflowIcon,
@@ -172,22 +168,11 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   run_linter: spec('runLinter', ListChecksIcon, 'code'),
   run_tests: spec('runTests', ListChecksIcon, 'code'),
   lsp: spec('analyzeCode', CodeIcon, 'code', { chip: chip.path() }),
-  insert_sql_record: spec('insertRecord', DatabaseIcon, 'system', { chip: chip.text('table') }),
 
   // ── Shell and system ────────────────────────────────────────────────────
   shell: spec('runCommand', SquareTerminalIcon, 'shell', { chip: chip.command(), body: 'shell' }),
-  node_exec: spec('runCode', SquareTerminalIcon, 'shell', {
-    chip: chip.command('script_path', 'inline_code'),
-    body: 'shell',
-  }),
-  python_exec: spec('runCode', SquareTerminalIcon, 'shell', {
-    chip: chip.command('script_path', 'inline_code'),
-    body: 'shell',
-  }),
-  npm_exec: spec('runPackageManager', SquareTerminalIcon, 'shell', {
-    chip: chip.command('subcommand'),
-    body: 'shell',
-  }),
+  // Follows a `shell` command left running past its yield point.
+  shell_process: spec('wait', SquareTerminalIcon, 'shell', { chip: chip.text('process') }),
   detect_tools: spec('checkInstalledTools', ScanSearchIcon, 'system'),
   install_tool: spec('installTool', PackagePlusIcon, 'system', {
     chip: chip.text('package', 'tool_name'),
@@ -195,7 +180,11 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   current_time: spec('checkTime', ClockIcon, 'system'),
   resolve_time: spec('resolveDate', ClockIcon, 'system', { chip: chip.text('expr') }),
   retrieve_tool_output: spec('retrieveOutput', ArchiveRestoreIcon, 'system'),
-  tinyjuice_retrieve: spec('retrieveOutput', ArchiveRestoreIcon, 'system'),
+  juice_retrieve: spec('retrieveOutput', ArchiveRestoreIcon, 'system'),
+  // REPL tools over a stored (handle) tool result; they reuse existing phrases.
+  juice_find: spec('searchCode', TextSearchIcon, 'system', { chip: chip.text('query') }),
+  juice_extract: spec('extractDetails', LayersIcon, 'system'),
+  juice_summarize: spec('extractDetails', LayersIcon, 'system'),
   read_workspace_state: spec('reviewWorkspace', FolderOpenIcon, 'system'),
   proxy_config: spec('configureProxy', SettingsIcon, 'system', { chip: chip.text('action') }),
   update_check: spec('checkUpdates', DownloadIcon, 'system'),
@@ -208,6 +197,16 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   // ── Web ─────────────────────────────────────────────────────────────────
   web_search: webSearch('searchWeb'),
   web_search_tool: webSearch('searchWeb'),
+  // Role tool: image search over the same web-search module.
+  web_image_search_tool: webSearch('searchImages', ImageIcon),
+  // Role tools: `web_answer_tool` returns a grounded answer with citations
+  // (and runs deep research on `depth: "deep"`); `web_contents_tool` reads
+  // the given URLs.
+  web_answer_tool: webSearch('askTheWeb'),
+  web_contents_tool: readPages,
+  gemini_agentic_search: webSearch('askTheWeb'),
+  gemini_deep_research: webSearch('research', TelescopeIcon),
+  exa_answer: webSearch('askTheWeb'),
   exa_search: webSearch('searchWeb'),
   tavily_search: webSearch('searchWeb'),
   querit_search: webSearch('searchWeb'),
@@ -226,6 +225,8 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   tavily_extract: readPages,
   parallel_extract: readPages,
   tinyfish_fetch: readPages,
+  // Parallel was removed from the core; these stay so old transcripts still
+  // render with a meaningful label.
   parallel_research: spec('research', TelescopeIcon, 'web', { chip: chip.query() }),
   parallel_chat: spec('askTheWeb', GlobeIcon, 'web', { chip: chip.query() }),
   parallel_enrich: spec('enrichData', SparklesIcon, 'web', { chip: chip.query() }),
@@ -263,19 +264,16 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   }),
   media_list_models: spec('checkMediaModels', ImageIcon, 'media'),
   generate_document: spec('createDocument', FileTextIcon, 'media', { chip: chip.text('title') }),
+  show_ui: spec('showView', AppWindowIcon, 'skill'),
   generate_presentation: spec('createPresentation', PresentationIcon, 'media', {
     chip: chip.text('title'),
   }),
-  audio_generate_podcast: spec('generatePodcast', PodcastIcon, 'media', {
-    chip: chip.text('title', 'topic'),
-  }),
-  audio_email_podcast: spec('emailPodcast', PodcastIcon, 'media', { chip: chip.text('to') }),
-  audio_generate_and_email_podcast: spec('createAndEmailPodcast', PodcastIcon, 'media', {
-    chip: chip.text('title', 'topic'),
-  }),
 
   // ── Memory ──────────────────────────────────────────────────────────────
-  memory: spec('searchMemory', BrainIcon, 'memory', { chip: chip.query() }),
+  // The single memory tool: recall asks a `question`, fetch a `query`, learn stores `text`.
+  memory: spec('searchMemory', BrainIcon, 'memory', {
+    chip: chip.text('question', 'query', 'text'),
+  }),
   memory_store: spec('saveToMemory', SaveIcon, 'memory', { chip: chip.text('key', 'content') }),
   memory_recall: spec('recallMemories', BrainCircuitIcon, 'memory', { chip: chip.query() }),
   memory_forget: spec('forgetMemory', EraserIcon, 'memory', { chip: chip.text('key') }),
@@ -303,27 +301,9 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
 
   // ── Agents and delegation ──────────────────────────────────────────────
   spawn_subagent: spec('delegateTask', BotIcon, 'agent', { chip: chip.text('agent_id') }),
+  // Kept for recorded transcripts from before the single-spawn contract.
   spawn_async_subagent: spec('delegateTask', BotIcon, 'agent', { chip: chip.text('agent_id') }),
-  spawn_worker_thread: spec('delegateTask', BotIcon, 'agent', { chip: chip.text('agent_id') }),
-  delegate_graph: spec('delegateTask', BotIcon, 'agent', { chip: chip.text('agent_id') }),
-  delegate: spec('delegateTask', BotIcon, 'agent', { chip: chip.text('agent') }),
-  delegate_to: spec('delegateTask', BotIcon, 'agent', { chip: chip.text('agent', 'agent_id') }),
-  spawn_parallel_agents: spec('runAgentsInParallel', UsersIcon, 'agent'),
-  continue_subagent: spec('messageAgent', MessageSquareReplyIcon, 'agent', {
-    chip: chip.text('agent_id'),
-  }),
-  steer_subagent: spec('messageAgent', MessageSquareReplyIcon, 'agent', {
-    chip: chip.text('agent_id'),
-  }),
-  wait_subagent: spec('waitForAgent', HourglassIcon, 'agent'),
-  close_subagent: spec('closeAgent', BotIcon, 'agent'),
-  list_subagents: spec('checkAgents', BotIcon, 'agent'),
-  wait: spec('wait', HourglassIcon, 'agent'),
-  wait_loop: spec('wait', HourglassIcon, 'agent'),
   ask_user_clarification: spec('askQuestion', MessageCircleQuestionIcon, 'agent', {
-    chip: chip.text('question'),
-  }),
-  agent_prepare_context: spec('prepareContext', LayersIcon, 'agent', {
     chip: chip.text('question'),
   }),
   extract_from_result: spec('extractDetails', LayersIcon, 'agent'),
@@ -335,6 +315,7 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   goal_set: spec('setGoal', FlagIcon, 'plan', { chip: chip.text('objective') }),
   goal_get: spec('checkGoal', FlagIcon, 'plan'),
   goal_complete: spec('completeGoal', FlagIcon, 'plan'),
+  goal_resume: spec('resumeGoal', FlagIcon, 'plan'),
 
   // ── Scheduling ──────────────────────────────────────────────────────────
   cron: spec('checkSchedules', CalendarClockIcon, 'schedule'),
@@ -363,7 +344,6 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   gmail_unsubscribe: spec('unsubscribe', MailXIcon, 'app', { chip: chip.text('sender', 'email') }),
   google_places_search: spec('searchPlaces', MapPinIcon, 'app', { chip: chip.query() }),
   google_places_details: spec('lookUpPlace', MapPinIcon, 'app', { chip: chip.text('place_id') }),
-  twilio_call: spec('placeCall', PhoneIcon, 'app', { chip: chip.text('to') }),
 
   // ── MCP ─────────────────────────────────────────────────────────────────
   mcp_list_servers: spec('checkMcpServers', ServerIcon, 'mcp'),
@@ -452,7 +432,12 @@ export const EXACT_TOOL_SPECS: Record<string, ToolSpec> = {
   workspace_update_persona: spec('updatePersona', UserRoundIcon, 'system'),
   workspace_reset_persona: spec('updatePersona', UserRoundIcon, 'system'),
   workspace_init: spec('setUpWorkspace', FolderOpenIcon, 'system'),
-  artifact_delete: spec('deleteArtifact', PackageIcon, 'system'),
+  create_artifact: spec('createArtifact', PackageIcon, 'system'),
+  update_artifact: spec('updateArtifact', PackageIcon, 'system'),
+  read_artifact: spec('checkArtifacts', PackageIcon, 'system'),
+  list_artifacts: spec('checkArtifacts', PackageIcon, 'system'),
+  delete_artifact: spec('deleteArtifact', PackageIcon, 'system'),
+  share_artifact: spec('shareArtifact', PackageIcon, 'system'),
 };
 
 /**
@@ -464,9 +449,15 @@ export const ACTION_TOOL_SPECS: Record<string, { arg: string; specs: Record<stri
   memory: {
     arg: 'action',
     specs: {
-      recall: spec('recallMemories', BrainCircuitIcon, 'memory', { chip: chip.query() }),
-      store: spec('saveToMemory', SaveIcon, 'memory', { chip: chip.text('key', 'content') }),
+      // Memory v2 actions.
+      recall: spec('recallMemories', BrainCircuitIcon, 'memory', {
+        chip: chip.text('question', 'query'),
+      }),
+      fetch: spec('searchMemory', BrainIcon, 'memory', { chip: chip.query() }),
+      learn: spec('saveToMemory', SaveIcon, 'memory', { chip: chip.text('text') }),
       forget: spec('forgetMemory', EraserIcon, 'memory', { chip: chip.text('key') }),
+      // v1 actions, kept so persisted transcripts still render.
+      store: spec('saveToMemory', SaveIcon, 'memory', { chip: chip.text('key', 'content') }),
       hybrid_search: spec('searchMemory', BrainIcon, 'memory', { chip: chip.query() }),
       vector_search: spec('searchMemory', BrainIcon, 'memory', { chip: chip.query() }),
       raw_search: spec('searchMemory', BrainIcon, 'memory', { chip: chip.query() }),
@@ -598,11 +589,14 @@ export const FAMILY_TOOL_SPECS: ReadonlyArray<{ test: RegExp; spec: ToolSpec }> 
  * Named agents, reached as `subagent:<id>`, as `spawn_subagent { agent_id }`,
  * as `delegate_<id>`, or as the custom delegate tool names agent TOMLs
  * declare (`delegate_name`).
+ *
+ * Some entries name specialists the core no longer ships (`code_executor`,
+ * `tools_agent`, `do_crypto`, `manage_settings`, `schedule_task`,
+ * `use_mcp_server`, `ask_docs`, `run_code`, `review_code`, `plan`): they are
+ * now inline skills, but existing transcripts still replay those calls, so the
+ * labels stay for history.
  */
 export const AGENT_SPECS: Record<string, ToolSpec> = {
-  researcher: spec('research', TelescopeIcon, 'agent'),
-  research: spec('research', TelescopeIcon, 'agent'),
-  context_scout: spec('scoutContext', LayersIcon, 'agent'),
   orchestrator: spec('planNextSteps', BotIcon, 'agent'),
   plan: spec('planNextSteps', BotIcon, 'agent'),
   planner: spec('planNextSteps', BotIcon, 'agent'),

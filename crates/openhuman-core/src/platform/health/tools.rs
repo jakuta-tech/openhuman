@@ -12,6 +12,10 @@ pub struct HealthSnapshotTool;
 
 #[async_trait]
 impl Tool for HealthSnapshotTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "health_snapshot"
     }
@@ -41,6 +45,10 @@ pub struct HealthSystemInfoTool;
 
 #[async_trait]
 impl Tool for HealthSystemInfoTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "health_system_info"
     }
@@ -63,6 +71,11 @@ impl Tool for HealthSystemInfoTool {
     fn is_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
         true
     }
+}
+
+/// Build this domain's tools in their persisted catalogue order.
+pub(crate) fn registered_tools() -> Vec<Box<dyn tinytools::Tool>> {
+    vec![Box::new(HealthSnapshotTool), Box::new(HealthSystemInfoTool)]
 }
 
 #[cfg(test)]

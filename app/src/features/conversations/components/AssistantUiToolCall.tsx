@@ -14,7 +14,17 @@ import type {
 } from '../../../store/chatRuntimeSlice';
 import { openUrl } from '../../../utils/openUrl';
 import { ToolFailureCard } from '../aui/ToolFailureCard';
-import { FetchBody, FileBody, ShellBody, WebSearchBody } from '../tools/ToolBodies';
+import { useLiveElapsed, useRunningSince } from '../aui/useLiveElapsed';
+import { McpUiBody } from '../tools/mcpUi/McpUiBody';
+import { readMcpUiPresentation } from '../tools/mcpUi/types';
+import { isSearchBalanceError } from '../tools/parseWebSearchResult';
+import {
+  FetchBody,
+  FileBody,
+  SearchBalanceHint,
+  ShellBody,
+  WebSearchBody,
+} from '../tools/ToolBodies';
 import { hasDisplayValue, parsedValue, ToolDataView } from '../tools/ToolDataView';
 import { ToolIcon } from '../tools/ToolIcon';
 import { describeToolCall, parseToolArgs, toolLabel } from '../tools/toolPresentation';
@@ -120,6 +130,11 @@ export function AssistantUiToolCallCard({
   const doneLabel = toolLabel({ ...presentation, tense: 'done' }, t);
   const failed = status === 'error';
   const awaiting = awaitingUser || status === 'awaiting_user';
+  // Live clock while the tool runs (not while it waits on the user, whose
+  // time is not the tool's). Tool parts carry no start timestamp, so the clock
+  // starts when the row first renders running — after a remount it restarts.
+  const liveRunning = running && !awaiting;
+  const liveMs = useLiveElapsed(useRunningSince(liveRunning), liveRunning);
   const outcome: ToolCallOutcome = failed
     ? 'error'
     : status === 'cancelled'
@@ -155,10 +170,18 @@ export function AssistantUiToolCallCard({
           ? FileBody({ args: parsedArgs, result: output })
           : null;
   const showOutput = !searchBody && hasDisplayValue(parsedValue(output));
+  const mcpUi = !running && readMcpUiPresentation(structured) ? structured : undefined;
+  // Managed search out of balance: say so plainly instead of leaving the user
+  // to decode the raw error.
+  const balanceHint =
+    failed &&
+    presentation.category === 'web' &&
+    (isSearchBalanceError(output) || isSearchBalanceError(failure));
 
   return (
     <ToolCall
       data-testid="assistant-ui-tool-call"
+      data-tool-name={toolName}
       className="max-w-none"
       label={doneLabel}
       activeLabel={activeLabel}
@@ -202,6 +225,10 @@ export function AssistantUiToolCallCard({
             <span data-testid="tool-call-elapsed" className="tabular-nums">
               {formatElapsed(elapsedMs)}
             </span>
+          ) : liveMs !== undefined && liveMs >= 1000 ? (
+            <span data-testid="tool-call-elapsed-live" className="tabular-nums">
+              {formatElapsed(Math.floor(liveMs / 1000) * 1000)}
+            </span>
           ) : null}
         </>
       }
@@ -213,13 +240,24 @@ export function AssistantUiToolCallCard({
                 toolName={toolName}
                 target={detail ?? displayName}
                 failure={failure}
+                diagnostic={typeof result === 'string' ? result : undefined}
               />
+            </div>
+          ) : null}
+          {balanceHint ? (
+            <div className="ps-5.5 pt-1 pb-2">
+              <SearchBalanceHint t={t} />
             </div>
           ) : null}
           {footer ? <div className="ps-5.5">{footer}</div> : null}
           {/* Search results are the call's whole point: visible without
               opening the disclosure, as in assistant-ui's own web-search. */}
           {searchBody ? <div className="ps-5.5 pt-1 pb-2">{searchBody}</div> : null}
+          {mcpUi !== undefined ? (
+            <div className="ps-5.5 pt-1 pb-2">
+              <McpUiBody structured={mcpUi} />
+            </div>
+          ) : null}
         </>
       }>
       {richBody ? <div className="mt-2 ps-5.5">{richBody}</div> : undefined}

@@ -1,22 +1,87 @@
-//! Host adapter for the loadable TinyBrowser module.
+//! Host adapter for the browser members of the loadable TinyComputer module.
+//!
+//! TinyComputer serves its browser members (`BrowserOpenSession`,
+//! `BrowserNavigate`, ...) on the same interface as its desktop members, so
+//! this adapter shares the desktop adapter's proxy, which loads the module and
+//! refreshes its private configuration before a call.
 
 use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
-use tinybrowser_bus::{
+use tinycomputer_bus::agent::Capabilities;
+use tinycomputer_bus::browser::{
     names, Action, ActionOutcome, DownloadInfo, DownloadWaitRequest, NavigateRequest, PageState,
-    PageText, ReadRequest, SessionId, SessionInfo, SessionOptions, Snapshot, SnapshotRequest,
-    Viewport,
+    PageText, ReadRequest, SessionId, SessionInfo, SessionOptions, SessionRef, SessionRequest,
+    Snapshot, SnapshotRequest, Viewport,
 };
+use tinycomputer_bus::DesktopResponse;
 
-use super::{host, ops, registry};
 use crate::config::Config;
 
-pub const MODULE_ID: &str = "tinybrowser";
+pub const MODULE_ID: &str = super::desktop::MODULE_ID;
+
+/// What the agent is told when TinyComputer finds no Chrome. The module looks
+/// in its own cache, the standard install locations, and the Puppeteer and
+/// Playwright caches, so a Chrome kept anywhere else (`~/Applications`, the
+/// Desktop) needs its path set. Left without this, an agent tried to install
+/// a browser itself (`npx agent-browser install`, then `sudo`).
+pub(crate) const CHROME_NOT_FOUND_HINT: &str = "Chrome was not found. Ask the user to set \
+    the full path to the Chrome program under Connections > Computer Control > Browser > \
+    Chrome path (for example /Applications/Google Chrome.app/Contents/MacOS/Google Chrome), \
+    then try again. Do not install or download a browser yourself.";
+
+/// What the agent is told when the Chrome path the user set names no Chrome
+/// the module can start: refused when a task starts, or when the browser
+/// launches. Left without it, the agent reads TinyComputer's own field name
+/// (`browser_executable`), which is nothing the user can find.
+pub(crate) const CHROME_PATH_HINT: &str = "Chrome could not be started from the Chrome \
+    path the user set. Ask the user to set Connections > Computer Control > Browser > Chrome \
+    path to the Chrome program itself (for example /Applications/Google Chrome.app/Contents/\
+    MacOS/Google Chrome), then try again. Do not install or download a browser yourself.";
+
+/// How TinyComputer says no Chrome was found: agent-browser's own words
+/// before TinyComputer 0.11, and the module's since.
+/// Where Chrome puts a tab whose navigation failed
+/// (`chrome-error://chromewebdata/`).
+const CHROME_ERROR_SCHEME: &str = "chrome-error:";
+
+const CHROME_MISSING: &[&str] = &["chrome not found", "no chrome or chromium was found"];
+
+/// How TinyComputer says the browser binary it was given would not start, or
+/// is no executable at all (refused before a task starts).
+const CHROME_UNUSABLE: &[&str] = &[
+    "browser binary given could not be started",
+    "browser_executable must be the absolute path",
+];
+
+/// Whether a module error or task failure says Chrome could not be found.
+pub(crate) fn chrome_not_found(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    CHROME_MISSING.iter().any(|said| text.contains(said))
+}
+
+/// Whether a module error or task failure says the Chrome path the user set
+/// names no Chrome the module can start.
+pub(crate) fn chrome_path_unusable(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    CHROME_UNUSABLE.iter().any(|said| text.contains(said))
+}
+
+/// What the agent is told to ask of the user when `text`, a module error or a
+/// task failure, says Chrome is missing or its path is unusable.
+pub(crate) fn chrome_hint(text: &str) -> Option<&'static str> {
+    if chrome_not_found(text) {
+        Some(CHROME_NOT_FOUND_HINT)
+    } else if chrome_path_unusable(text) {
+        Some(CHROME_PATH_HINT)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserCallError {
-    #[error("TinyBrowser unavailable: {0}")]
+    #[error("TinyComputer browser unavailable: {0}")]
     Unavailable(String),
     #[error("browser request blocked: {0}")]
     Policy(String),
@@ -31,9 +96,33 @@ impl BrowserCallError {
             message: error.to_string(),
         }
     }
+
+    /// A failed reply names its error in `details.name` (the
+    /// `ai.tinyhumans.tinycomputer.Browser.Error.*` spelling); older replies
+    /// carry only the envelope code.
+    fn from_response(response: &DesktopResponse) -> Self {
+        let Some(error) = response.error.as_ref() else {
+            return Self::Bus {
+                name: "ModuleFailed".into(),
+                message: format!("{} failed without an error", response.command),
+            };
+        };
+        let name = error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(|name| name.rsplit('.').next().unwrap_or(name).to_owned())
+            .unwrap_or_else(|| error.code.clone());
+        let message = match chrome_hint(&error.message) {
+            Some(hint) => format!("{} {hint}", error.message),
+            None => error.message.clone(),
+        };
+        Self::Bus { name, message }
+    }
 }
 
-/// A TinyBrowser connection that applies this host's settings and shared web policy.
+/// A TinyComputer browser connection that applies this host's settings and shared web policy.
 #[derive(Clone)]
 pub struct BrowserClient {
     config: Arc<Config>,
@@ -49,21 +138,27 @@ impl BrowserClient {
     }
 
     pub async fn ensure_ready(&self) -> Result<(), BrowserCallError> {
-        ops::ensure_loaded(&self.config, MODULE_ID)
-            .await
-            .map_err(BrowserCallError::Unavailable)?;
         let version = self.contract_version().await?;
-        if !tinybrowser_bus::is_compatible(version) {
+        if !tinycomputer_bus::is_compatible(version) {
             return Err(BrowserCallError::Unavailable(format!(
-                "incompatible TinyBrowser contract: module {version:?}, host {:?}",
-                tinybrowser_bus::CONTRACT_VERSION
+                "incompatible TinyComputer contract: module {version:?}, host {:?}",
+                tinycomputer_bus::CONTRACT_VERSION
             )));
         }
         Ok(())
     }
 
+    /// The module's contract version, from `Describe` (which answers raw
+    /// [`Capabilities`], not an envelope).
     pub async fn contract_version(&self) -> Result<(u32, u32), BrowserCallError> {
-        self.call(names::methods::CONTRACT_VERSION, ()).await
+        let proxy = super::desktop::proxy(&self.config)
+            .await
+            .map_err(BrowserCallError::Unavailable)?;
+        let capabilities: Capabilities = proxy
+            .call(tinycomputer_bus::agent::names::methods::DESCRIBE, ())
+            .await
+            .map_err(BrowserCallError::from_bus)?;
+        Ok(capabilities.contract_version)
     }
 
     pub async fn open_session(
@@ -80,7 +175,7 @@ impl BrowserClient {
     ) -> Result<SessionInfo, BrowserCallError> {
         self.ensure_ready().await?;
         let domains = self.browser_domains();
-        if domains.is_empty() && !browser_allow_all() {
+        if domains.is_empty() && !browser_allow_all() && !self.allows_any_site() {
             return Err(BrowserCallError::Policy(
                 "allowed websites list is empty".into(),
             ));
@@ -113,11 +208,23 @@ impl BrowserClient {
         } else {
             None
         };
+        let claimed = claim_profile(
+            &self.config,
+            &mut options,
+            super::profile_claim::SESSION_WAIT_MS,
+        )
+        .await;
         options.download_dir = browser.download_dir.clone();
         options.default_timeout_ms = browser.task_timeout_secs.saturating_mul(1000);
         options.allowed_origins =
             origin.map_or_else(|| self.browser_origins(), |origin| vec![origin]);
-        self.call(names::methods::OPEN_SESSION, (options,)).await
+        let opened = self.call(names::methods::OPEN_SESSION, options).await;
+        // An open session's Chrome holds the profile itself; one that did
+        // not open holds nothing.
+        if let Some(profile) = claimed {
+            super::profile_claim::release(&self.config, &profile).await;
+        }
+        opened
     }
 
     /// Open a session bound to the host tree of an explicit destination.
@@ -155,7 +262,10 @@ impl BrowserClient {
     ) -> Result<PageState, BrowserCallError> {
         self.check_url(&request.url)?;
         let page: PageState = self
-            .call(names::methods::NAVIGATE, (session, request))
+            .call(
+                names::methods::NAVIGATE,
+                SessionRequest::new(session.clone(), request),
+            )
             .await?;
         self.check_returned_url(&page.url)?;
         Ok(page)
@@ -167,7 +277,10 @@ impl BrowserClient {
         request: SnapshotRequest,
     ) -> Result<Snapshot, BrowserCallError> {
         let snapshot: Snapshot = self
-            .call(names::methods::SNAPSHOT, (session, request))
+            .call(
+                names::methods::SNAPSHOT,
+                SessionRequest::new(session.clone(), request),
+            )
             .await?;
         self.check_returned_url(&snapshot.url)?;
         Ok(snapshot)
@@ -179,7 +292,10 @@ impl BrowserClient {
         action: Action,
     ) -> Result<ActionOutcome, BrowserCallError> {
         let outcome: ActionOutcome = self
-            .call(names::methods::PERFORM, (session, action))
+            .call(
+                names::methods::PERFORM,
+                SessionRequest::new(session.clone(), action),
+            )
             .await?;
         self.check_returned_url(&outcome.page.url)?;
         Ok(outcome)
@@ -191,7 +307,10 @@ impl BrowserClient {
         request: ReadRequest,
     ) -> Result<PageText, BrowserCallError> {
         let page: PageText = self
-            .call(names::methods::READ_PAGE, (session, request))
+            .call(
+                names::methods::READ_PAGE,
+                SessionRequest::new(session.clone(), request),
+            )
             .await?;
         self.check_returned_url(&page.url)?;
         Ok(page)
@@ -201,7 +320,8 @@ impl BrowserClient {
         &self,
         session: &SessionId,
     ) -> Result<Vec<DownloadInfo>, BrowserCallError> {
-        self.call(names::methods::LIST_DOWNLOADS, (session,)).await
+        self.call(names::methods::LIST_DOWNLOADS, session_ref(session))
+            .await
     }
 
     pub async fn wait_download(
@@ -209,12 +329,18 @@ impl BrowserClient {
         session: &SessionId,
         request: DownloadWaitRequest,
     ) -> Result<DownloadInfo, BrowserCallError> {
-        self.call(names::methods::WAIT_DOWNLOAD, (session, request))
-            .await
+        self.call(
+            names::methods::WAIT_DOWNLOAD,
+            SessionRequest::new(session.clone(), request),
+        )
+        .await
     }
 
     pub async fn close_session(&self, session: &SessionId) -> Result<(), BrowserCallError> {
-        self.call(names::methods::CLOSE_SESSION, (session,)).await
+        let _closed: serde_json::Value = self
+            .call(names::methods::CLOSE_SESSION, session_ref(session))
+            .await?;
+        Ok(())
     }
 
     pub(crate) fn check_url(&self, raw: &str) -> Result<(), BrowserCallError> {
@@ -250,6 +376,7 @@ impl BrowserClient {
             )));
         }
         if !allow_all
+            && !self.allows_any_site()
             && !self.browser_domains().iter().any(|allowed| {
                 host.eq_ignore_ascii_case(allowed)
                     || host
@@ -271,7 +398,54 @@ impl BrowserClient {
         if raw.eq_ignore_ascii_case("about:blank") {
             return Ok(());
         }
-        self.check_url(raw)
+        // A navigation that failed (DNS, a refused or reset connection, a
+        // certificate) leaves Chrome on its own error page. Refusing it as
+        // a policy breach hid the failure: an agent read "only HTTPS URLs"
+        // and kept clicking. Say the page did not load.
+        if raw
+            .get(..CHROME_ERROR_SCHEME.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(CHROME_ERROR_SCHEME))
+        {
+            return Err(BrowserCallError::Bus {
+                name: "PageLoadFailed".into(),
+                message: "the page failed to load (Chrome showed its error page); \
+                          the site or the network refused it"
+                    .into(),
+            });
+        }
+        // Name the scheme the page is on, never the rest of its address: a
+        // log then says what it was without keeping what was in it.
+        self.check_url(raw).map_err(|error| match error {
+            BrowserCallError::Policy(reason) if reason == "only HTTPS URLs are allowed" => {
+                let scheme = raw.split_once(':').map_or("", |(scheme, _)| scheme);
+                let scheme = if !scheme.is_empty()
+                    && scheme.len() <= 32
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                {
+                    format!("{}:", scheme.to_ascii_lowercase())
+                } else {
+                    "an unknown scheme".into()
+                };
+                BrowserCallError::Policy(format!(
+                    "only HTTPS URLs are allowed (the page is on {scheme})"
+                ))
+            }
+            other => other,
+        })
+    }
+
+    /// Whether the allowed websites are "Allow all" (`*`): the browser may
+    /// open any public site, as web fetch may. Private and local addresses
+    /// stay refused, here by `check_url` and in the module by its own `*`
+    /// rule. The browser itself is off until the user turns it on.
+    fn allows_any_site(&self) -> bool {
+        self.config
+            .http_request
+            .allowed_domains
+            .iter()
+            .any(|domain| domain.trim() == "*")
     }
 
     fn browser_domains(&self) -> Vec<String> {
@@ -284,15 +458,27 @@ impl BrowserClient {
             .collect()
     }
 
+    /// Origins a TinyComputer task may open pages on: `*` (any public site)
+    /// under "Allow all", else the allowed websites in the module's
+    /// `https://.host` spelling. Empty when none are allowed, which a task
+    /// refuses, since an empty list means any origin, private ones included,
+    /// to the module.
+    pub(crate) fn task_origins(&self) -> Vec<String> {
+        self.browser_origins()
+    }
+
     fn browser_origins(&self) -> Vec<String> {
         self.browser_origins_for_mode(browser_allow_all())
     }
 
     fn browser_origins_for_mode(&self, allow_all: bool) -> Vec<String> {
         if allow_all {
-            // A nonempty, unmatchable origin keeps TinyBrowser's document
+            // A nonempty, unmatchable origin keeps TinyComputer's document
             // guard active before the caller supplies an explicit URL.
             return vec!["https://.".to_owned()];
+        }
+        if self.allows_any_site() {
+            return vec!["*".to_owned()];
         }
         self.browser_domains()
             .iter()
@@ -306,23 +492,36 @@ impl BrowserClient {
             .collect()
     }
 
-    async fn call<A: Serialize, R: DeserializeOwned>(
+    async fn call<A: Serialize + Send, R: DeserializeOwned>(
         &self,
         member: &str,
-        args: A,
+        request: A,
     ) -> Result<R, BrowserCallError> {
-        let record = registry::find(MODULE_ID)
-            .ok_or_else(|| BrowserCallError::Unavailable("TinyBrowser is not registered".into()))?;
-        let runtime = host::runtime()
+        let proxy = super::desktop::proxy(&self.config)
             .await
-            .map_err(|_| BrowserCallError::Unavailable("the module bus is not running".into()))?;
-        let proxy = runtime
-            .proxy(record.bus_name, record.object_path)
+            .map_err(BrowserCallError::Unavailable)?;
+        tracing::debug!(member, "[browser] tinycomputer call");
+        let response: DesktopResponse = proxy
+            .call(member, (request,))
+            .await
             .map_err(BrowserCallError::from_bus)?;
-        proxy
-            .call(member, args)
-            .await
-            .map_err(BrowserCallError::from_bus)
+        if !response.ok {
+            let error = BrowserCallError::from_response(&response);
+            tracing::debug!(member, error = %error, "[browser] tinycomputer call failed");
+            return Err(error);
+        }
+        serde_json::from_value(response.data.unwrap_or(serde_json::Value::Null)).map_err(|error| {
+            BrowserCallError::Bus {
+                name: "InvalidReply".into(),
+                message: format!("{member} returned an unexpected reply: {error}"),
+            }
+        })
+    }
+}
+
+fn session_ref(session: &SessionId) -> SessionRef {
+    SessionRef {
+        session: session.clone(),
     }
 }
 
@@ -330,6 +529,30 @@ fn parsed_browser_url(raw: &str) -> Result<url::Url, BrowserCallError> {
     url::Url::parse(raw)
         .or_else(|_| url::Url::parse(&format!("https://{raw}")))
         .map_err(|_| BrowserCallError::Policy("invalid URL".into()))
+}
+
+/// Claims `options`' persistent profile for the session's browser, or leaves
+/// it a fresh profile when another browser still holds the folder after
+/// `wait`; the folder it claimed. Chrome lets one browser at a time use a
+/// profile folder: a second one hands its window to the first and exits, and
+/// a session in one conversation found the profile held by another
+/// conversation's browser, or a task's.
+async fn claim_profile(
+    config: &Config,
+    options: &mut SessionOptions,
+    wait_ms: u64,
+) -> Option<String> {
+    let profile = options.user_data_dir.clone()?;
+    match super::profile_claim::claim(config, &profile, wait_ms).await {
+        super::profile_claim::Claim::Claimed(path) => Some(path),
+        super::profile_claim::Claim::Fresh => {
+            tracing::warn!(
+                "[browser] another browser holds the persistent profile; this session uses a fresh profile"
+            );
+            options.user_data_dir = None;
+            None
+        }
+    }
 }
 
 fn browser_allow_all() -> bool {
@@ -344,61 +567,16 @@ fn private_or_local(host: &str) -> bool {
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
         return true;
     }
+    // The network tools' full non-global list, so the browser blocks the same
+    // reserved, benchmarking and documentation ranges they do.
     match host.parse::<std::net::IpAddr>() {
+        // `is_non_global_v4` already covers 0.0.0.0/8; the explicit octet check
+        // keeps that local-host range visibly blocked at this call site too.
         Ok(std::net::IpAddr::V4(ip)) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.octets()[0] == 0
-                || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+            tinyagents_harness::url_guard::is_non_global_v4(ip) || ip.octets()[0] == 0
         }
-        Ok(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| private_or_local(&mapped.to_string()))
-        }
+        Ok(std::net::IpAddr::V6(ip)) => tinyagents_harness::url_guard::is_non_global_v6(ip),
         Err(_) => false,
-    }
-}
-
-impl tinybrowser_control::BrowserControl for BrowserClient {
-    async fn snapshot(
-        &self,
-        session: &SessionId,
-        request: &SnapshotRequest,
-    ) -> Result<Snapshot, tinybrowser_control::BrowserControlError> {
-        BrowserClient::snapshot(self, session, request.clone())
-            .await
-            .map_err(control_error)
-    }
-
-    async fn perform(
-        &self,
-        session: &SessionId,
-        action: &Action,
-    ) -> Result<ActionOutcome, tinybrowser_control::BrowserControlError> {
-        BrowserClient::perform(self, session, action.clone())
-            .await
-            .map_err(control_error)
-    }
-}
-
-fn control_error(error: BrowserCallError) -> tinybrowser_control::BrowserControlError {
-    let name = match &error {
-        BrowserCallError::Bus { name, .. } => name.clone(),
-        BrowserCallError::Policy(_) => "PolicyDenied".into(),
-        BrowserCallError::Unavailable(_) => "ModuleUnavailable".into(),
-    };
-    tinybrowser_control::BrowserControlError {
-        name,
-        message: error.to_string(),
     }
 }
 

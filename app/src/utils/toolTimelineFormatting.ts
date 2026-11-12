@@ -212,8 +212,8 @@ export function buildProcessingBlocks(
         kind: 'thinking',
         key,
         text,
-        ...(item.startedAt !== undefined ? { startedAt: item.startedAt } : {}),
-        ...(item.endedAt !== undefined ? { endedAt: item.endedAt } : {}),
+        ...(item.startedAt == null ? {} : { startedAt: item.startedAt }),
+        ...(item.endedAt == null ? {} : { endedAt: item.endedAt }),
       });
     } else {
       blocks.push({ kind: item.kind, key, text });
@@ -273,6 +273,10 @@ export function extractAgentSources(entries: ToolTimelineEntry[]): AgentSource[]
       const parsed = parseWebSearchResult(entry.result, entry.structured);
       parsed?.results.forEach((hit, index) =>
         add({ id: `${entry.id}#${index}`, title: hit.title, url: hit.url })
+      );
+      // An answer call's citations are sources too.
+      parsed?.citations?.forEach((hit, index) =>
+        add({ id: `${entry.id}#c${index}`, title: hit.title, url: hit.url })
       );
       continue;
     }

@@ -6,29 +6,27 @@
 //! agent definitions / tool registry and printing something.
 //!
 //! Usage:
-//!   openhuman agent dump-prompt --agent <id> [--toolkit <slug>] [--workspace <path>] [--json] [--with-tools] [--wire] [-v]
-//!     (--toolkit is REQUIRED when --agent is `integrations_agent`.)
+//!   openhuman agent dump-prompt --agent <id> [--workspace <path>] [--json] [--with-tools] [--wire] [-v]
 //!   openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]
-//!   openhuman agent prompt-size [--agent <id>] [--toolkit <slug>] [--workspace <path>] [--json] [-v]
+//!   openhuman agent prompt-size [--agent <id>] [--workspace <path>] [--json] [-v]
 //!   openhuman agent list [--json] [-v]
 //!
-//! `dump-prompt` is the main tool: it renders the exact system prompt the
-//! context engine would hand to the LLM when that agent is spawned. The
-//! dump routes through [`OpenHumanSessionHost::from_config_for_agent`] and calls
-//! [`OpenHumanSessionHost::build_system_prompt`] on the live session, so the output is
-//! byte-identical to what the LLM sees on turn 1. Pass
+//! `dump-prompt` is the main tool: it renders the current-turn system prompt
+//! through the same prelude builder the runtime uses for a cold model request.
+//! Pass
 //! `--agent orchestrator` for the orchestrator prompt; otherwise pass
-//! any built-in or workspace-custom agent id (e.g. `integrations_agent`,
-//! `welcome`, `code_executor`).
+//! any built-in or workspace-custom agent id (e.g. `orchestrator`, `researcher`).
 
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
-use crate::agent::debug::prompt_size::{render_text, PromptSizeReport};
-use crate::agent::debug::{
+use crate::agent_registry::host_definition::AgentDefinitionRegistry;
+use crate::core::agent_cli::debug::prompt_size::{render_text, PromptSizeReport};
+use crate::core::agent_cli::debug::{
     dump_agent_prompt, dump_all_agent_prompts, write_prompt_dumps, DumpPromptOptions, DumpedPrompt,
 };
-use crate::agent::harness::definition::AgentDefinitionRegistry;
+
+pub(crate) mod debug;
 
 /// Entry point for `openhuman agent <subcommand>`.
 pub fn run_agent_command(args: &[String]) -> Result<()> {
@@ -71,7 +69,6 @@ struct PromptSizeFlags {
     /// `None` means "every registered agent" — the fleet-wide view the ratchet
     /// consumes.
     agent: Option<String>,
-    toolkit: Option<String>,
     workspace: Option<PathBuf>,
     model: Option<String>,
     json: bool,
@@ -83,7 +80,6 @@ struct PromptSizeFlags {
 
 fn parse_prompt_size_flags(args: &[String]) -> Result<PromptSizeFlags> {
     let mut agent: Option<String> = None;
-    let mut toolkit: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut model: Option<String> = None;
     let mut json = false;
@@ -100,14 +96,6 @@ fn parse_prompt_size_flags(args: &[String]) -> Result<PromptSizeFlags> {
                 agent = Some(
                     args.get(i + 1)
                         .ok_or_else(|| anyhow!("missing value for --agent"))?
-                        .clone(),
-                );
-                i += 2;
-            }
-            "--toolkit" | "-t" => {
-                toolkit = Some(
-                    args.get(i + 1)
-                        .ok_or_else(|| anyhow!("missing value for --toolkit"))?
                         .clone(),
                 );
                 i += 2;
@@ -144,7 +132,6 @@ fn parse_prompt_size_flags(args: &[String]) -> Result<PromptSizeFlags> {
     }
     Ok(PromptSizeFlags {
         agent,
-        toolkit,
         workspace,
         model,
         json,
@@ -185,7 +172,6 @@ fn run_prompt_size(args: &[String]) -> Result<()> {
     let reports: Vec<PromptSizeReport> = match &flags.agent {
         Some(agent_id) => {
             let mut options = DumpPromptOptions::new(agent_id.clone());
-            options.toolkit = flags.toolkit.clone();
             options.workspace_dir_override = flags.workspace.clone();
             options.config_path_override = config_path.clone();
             options.model_override = flags.model.clone();
@@ -250,7 +236,6 @@ fn print_prompt_size_help() {
     println!();
     println!("Options:");
     println!("  --agent, -a <id>     One agent. Omit to report every registered agent.");
-    println!("  --toolkit, -t <slug> REQUIRED when `--agent integrations_agent`.");
     println!("  --workspace, -w <p>  Workspace to resolve identity/memory files against.");
     println!("  --model, -m <name>   Override the resolved model name.");
     println!("  --hermetic           Also resolve config + credentials from the --workspace");
@@ -309,11 +294,11 @@ fn parse_dump_all_flags(args: &[String]) -> Result<DumpAllFlags> {
                 i += 1;
             }
             "-h" | "--help" => {
-                println!("Usage: openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]");
+                println!(
+                    "Usage: openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]"
+                );
                 println!();
                 println!("Render every registered agent's turn-1 system prompt into <dir>.");
-                println!("`integrations_agent` is expanded into one file per currently-connected");
-                println!("Composio toolkit; if no toolkit is connected, it is skipped.");
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown dump-all arg: {other}")),
@@ -366,7 +351,6 @@ fn run_dump_all(args: &[String]) -> Result<()> {
 
 struct DumpFlags {
     agent: Option<String>,
-    toolkit: Option<String>,
     workspace: Option<PathBuf>,
     model: Option<String>,
     json: bool,
@@ -378,7 +362,6 @@ struct DumpFlags {
 fn parse_dump_flags(args: &[String]) -> Result<DumpFlags> {
     let mut out = DumpFlags {
         agent: None,
-        toolkit: None,
         workspace: None,
         model: None,
         json: false,
@@ -393,14 +376,6 @@ fn parse_dump_flags(args: &[String]) -> Result<DumpFlags> {
                 out.agent = Some(
                     args.get(i + 1)
                         .ok_or_else(|| anyhow!("missing value for --agent"))?
-                        .clone(),
-                );
-                i += 2;
-            }
-            "--toolkit" | "-t" => {
-                out.toolkit = Some(
-                    args.get(i + 1)
-                        .ok_or_else(|| anyhow!("missing value for --toolkit"))?
                         .clone(),
                 );
                 i += 2;
@@ -449,30 +424,22 @@ fn parse_dump_flags(args: &[String]) -> Result<DumpFlags> {
 
 fn run_dump_prompt(args: &[String]) -> Result<()> {
     let flags = parse_dump_flags(args)?;
-    let agent = flags.agent.clone().ok_or_else(|| {
-        anyhow!("--agent <id> is required (e.g. `orchestrator`, `integrations_agent`, `welcome`)")
-    })?;
-
-    if agent == "integrations_agent" && flags.toolkit.is_none() {
-        return Err(anyhow!(
-            "--toolkit <slug> is required when --agent is `integrations_agent` \
-             (e.g. `--toolkit gmail`). Run `composio list_connection` to see active slugs."
-        ));
-    }
+    let agent = flags
+        .agent
+        .clone()
+        .ok_or_else(|| anyhow!("--agent <id> is required (e.g. `orchestrator`, `researcher`)"))?;
 
     init_quiet_logging(flags.verbose);
 
     log::debug!(
-        "[agent-cli] run_dump_prompt entry: agent={} toolkit={:?} workspace={:?} model={:?}",
+        "[agent-cli] run_dump_prompt entry: agent={} workspace={:?} model={:?}",
         agent,
-        flags.toolkit,
         flags.workspace,
         flags.model
     );
 
     let options = DumpPromptOptions {
         agent_id: agent,
-        toolkit: flags.toolkit.clone(),
         workspace_dir_override: flags.workspace.clone(),
         // `dump-prompt` deliberately keeps reading the real install: its job is
         // to show what the signed-in user's agent actually receives, including
@@ -501,7 +468,10 @@ fn run_dump_prompt(args: &[String]) -> Result<()> {
         // and splitting the header onto stderr the way `print_human` does
         // would make `> turn.txt` drop the byte counts that give the payload
         // its meaning.
-        print!("{}", crate::agent::debug::render_wire_dump(&dumped));
+        print!(
+            "{}",
+            crate::core::agent_cli::debug::render_wire_dump(&dumped)
+        );
     } else if flags.json {
         print_json(&dumped, flags.with_tools)?;
     } else {
@@ -517,9 +487,6 @@ fn print_human(dumped: &DumpedPrompt, with_tools: bool) {
     // in `core/cli.rs` (banner to stderr, JSON result to stdout).
     eprintln!("# Agent prompt dump");
     eprintln!("agent:          {}", dumped.agent_id);
-    if let Some(tk) = &dumped.toolkit {
-        eprintln!("toolkit:        {tk}");
-    }
     eprintln!("mode:           {}", dumped.mode);
     eprintln!("model:          {}", dumped.model);
     eprintln!("workspace:      {}", dumped.workspace_dir.display());
@@ -545,13 +512,6 @@ fn print_json(dumped: &DumpedPrompt, with_tools: bool) -> Result<()> {
     obj.insert(
         "agent_id".into(),
         serde_json::Value::String(dumped.agent_id.clone()),
-    );
-    obj.insert(
-        "toolkit".into(),
-        match &dumped.toolkit {
-            Some(tk) => serde_json::Value::String(tk.clone()),
-            None => serde_json::Value::Null,
-        },
     );
     obj.insert(
         "mode".into(),
@@ -633,7 +593,9 @@ fn run_list(args: &[String]) -> Result<()> {
             "-h" | "--help" => {
                 println!("Usage: openhuman agent list [--workspace <path>] [--json] [-v]");
                 println!();
-                println!("  List every built-in agent plus any custom `<workspace>/agents/*.toml` overrides.");
+                println!(
+                    "  List every built-in agent plus any custom `<workspace>/agents/*.toml` overrides."
+                );
                 return Ok(());
             }
             other => return Err(anyhow!("unknown list arg: {other}")),
@@ -671,11 +633,11 @@ fn run_list(args: &[String]) -> Result<()> {
             );
             obj.insert(
                 "omit_safety_preamble".into(),
-                serde_json::Value::Bool(def.omit_safety_preamble),
+                serde_json::Value::Bool(def.extensions.omit_safety_preamble),
             );
             obj.insert(
                 "omit_identity".into(),
-                serde_json::Value::Bool(def.omit_identity),
+                serde_json::Value::Bool(def.extensions.omit_identity),
             );
             arr.push(serde_json::Value::Object(obj));
         }
@@ -705,9 +667,11 @@ fn print_agent_help() {
     println!();
     println!("Usage:");
     println!("  openhuman agent list [--workspace <path>] [--json]");
-    println!("  openhuman agent dump-prompt --agent <id> [--workspace <path>] [--model <name>] [--with-tools] [--wire] [--json] [-v]");
+    println!(
+        "  openhuman agent dump-prompt --agent <id> [--workspace <path>] [--model <name>] [--with-tools] [--wire] [--json] [-v]"
+    );
     println!("  openhuman agent dump-all --out <dir> [--workspace <path>] [--model <name>] [-v]");
-    println!("  openhuman agent prompt-size [--agent <id>] [--toolkit <slug>] [--workspace <path>] [--json] [-v]");
+    println!("  openhuman agent prompt-size [--agent <id>] [--workspace <path>] [--json] [-v]");
     println!();
     println!("Run `openhuman agent <subcommand> --help` for details.");
 }
@@ -720,13 +684,9 @@ fn print_dump_prompt_help() {
     println!();
     println!("Required:");
     println!("  --agent, -a <id>     Target agent id — any built-in or workspace-custom id");
-    println!("                       (e.g. `orchestrator`, `integrations_agent`, `welcome`).");
+    println!("                       (e.g. `orchestrator`, `researcher`).");
     println!();
     println!("Options:");
-    println!("  --toolkit, -t <slug> REQUIRED when `--agent integrations_agent`. Names the");
-    println!("                       Composio toolkit to bind this dump to (e.g. `gmail`,");
-    println!("                       `notion`). Must match a currently-connected integration —");
-    println!("                       run `composio list_connection` to see the active slugs.");
     println!("  --workspace, -w <p>  Override the workspace directory (defaults to");
     println!("                       Config::workspace_dir / ~/.openhuman/workspace).");
     println!("  --model, -m <name>   Override the resolved model name (affects only the");
@@ -746,10 +706,8 @@ fn print_dump_prompt_help() {
     println!("  # Orchestrator prompt, JSON for scripting.");
     println!("  openhuman agent dump-prompt --agent orchestrator --json");
     println!();
-    println!("  # integrations_agent bound to the user's gmail connection.");
-    println!(
-        "  openhuman agent dump-prompt --agent integrations_agent --toolkit gmail --with-tools"
-    );
+    println!("  # Orchestrator prompt with its tool list.");
+    println!("  openhuman agent dump-prompt --agent orchestrator --with-tools");
 }
 
 fn is_help(value: &str) -> bool {

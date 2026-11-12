@@ -7,7 +7,6 @@ mod tests;
 
 mod catalog;
 mod claude_code_handlers;
-mod oauth_handlers;
 mod prompt_handlers;
 mod settings_handlers;
 
@@ -16,22 +15,12 @@ use serde_json::{Map, Value};
 
 use crate::core::all::RegisteredController;
 use crate::core::ControllerSchema;
-use crate::rpc::RpcOutcome;
+use crate::core::Outcome;
 
 pub use catalog::schemas;
 use claude_code_handlers::*;
-use oauth_handlers::*;
 use prompt_handlers::*;
 use settings_handlers::*;
-
-/// The canonical RPC method name for `inference.agent_chat`.
-///
-/// The controller's `namespace` + `function` combine into the wire method
-/// `openhuman.inference_agent_chat` ([`rpc_method_name`](crate::core::ControllerSchema)).
-/// Host facades (the embed library) reference this constant rather than
-/// spelling the string out, so a rename upstream cannot silently drift an
-/// embedder's dispatch string away from the registered controller.
-pub const INFERENCE_AGENT_CHAT: &str = "openhuman.inference_agent_chat";
 
 pub fn all_controller_schemas() -> Vec<ControllerSchema> {
     vec![
@@ -42,20 +31,11 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("update_local_settings"),
         schemas("list_models"),
         schemas("provider_auth_errors"),
-        schemas("device_profile"),
-        schemas("presets"),
-        schemas("apply_preset"),
         schemas("diagnostics"),
-        schemas("openai_oauth_start"),
-        schemas("openai_oauth_complete"),
-        schemas("openai_oauth_import_codex_cli"),
-        schemas("openai_oauth_status"),
-        schemas("openai_oauth_disconnect"),
         schemas("summarize"),
         schemas("prompt"),
         schemas("vision_prompt"),
         schemas("test_provider_model"),
-        schemas("should_react"),
         schemas("analyze_sentiment"),
         schemas("claude_code_status"),
         schemas("claude_code_auth_status"),
@@ -95,40 +75,8 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_inference_provider_auth_errors,
         },
         RegisteredController {
-            schema: schemas("device_profile"),
-            handler: handle_inference_device_profile,
-        },
-        RegisteredController {
-            schema: schemas("presets"),
-            handler: handle_inference_presets,
-        },
-        RegisteredController {
-            schema: schemas("apply_preset"),
-            handler: handle_inference_apply_preset,
-        },
-        RegisteredController {
             schema: schemas("diagnostics"),
             handler: handle_inference_diagnostics,
-        },
-        RegisteredController {
-            schema: schemas("openai_oauth_start"),
-            handler: handle_inference_openai_oauth_start,
-        },
-        RegisteredController {
-            schema: schemas("openai_oauth_complete"),
-            handler: handle_inference_openai_oauth_complete,
-        },
-        RegisteredController {
-            schema: schemas("openai_oauth_import_codex_cli"),
-            handler: handle_inference_openai_oauth_import_codex_cli,
-        },
-        RegisteredController {
-            schema: schemas("openai_oauth_status"),
-            handler: handle_inference_openai_oauth_status,
-        },
-        RegisteredController {
-            schema: schemas("openai_oauth_disconnect"),
-            handler: handle_inference_openai_oauth_disconnect,
         },
         RegisteredController {
             schema: schemas("summarize"),
@@ -145,10 +93,6 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: schemas("test_provider_model"),
             handler: handle_inference_test_provider_model,
-        },
-        RegisteredController {
-            schema: schemas("should_react"),
-            handler: handle_inference_should_react,
         },
         RegisteredController {
             schema: schemas("analyze_sentiment"),
@@ -177,6 +121,6 @@ fn deserialize_params<T: DeserializeOwned>(params: Map<String, Value>) -> Result
     serde_json::from_value(Value::Object(params)).map_err(|e| format!("invalid params: {e}"))
 }
 
-fn to_json<T: serde::Serialize>(outcome: RpcOutcome<T>) -> Result<Value, String> {
+fn to_json<T: serde::Serialize>(outcome: Outcome<T>) -> Result<Value, String> {
     outcome.into_cli_compatible_json()
 }

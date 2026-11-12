@@ -1,61 +1,12 @@
 use super::*;
-use std::path::Path;
 use std::sync::Arc;
 
+use crate::config::test_env::EnvVarGuard;
 use tinytools::ToolResult;
-struct WorkspaceEnvGuard {
-    previous: Option<std::ffi::OsString>,
-}
-
-impl WorkspaceEnvGuard {
-    fn set(path: &Path) -> Self {
-        let previous = std::env::var_os("OPENHUMAN_WORKSPACE");
-        unsafe {
-            std::env::set_var("OPENHUMAN_WORKSPACE", path);
-        }
-        Self { previous }
-    }
-}
-
-struct HomeEnvGuard {
-    previous: Option<std::ffi::OsString>,
-}
-
-impl HomeEnvGuard {
-    fn set(path: &Path) -> Self {
-        let previous = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", path);
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for HomeEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-}
-
-impl Drop for WorkspaceEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("OPENHUMAN_WORKSPACE", value),
-                None => std::env::remove_var("OPENHUMAN_WORKSPACE"),
-            }
-        }
-    }
-}
 
 /// Minimal `Arc<Config>` for the agent-tool constructors. All five
 /// composio agent tools now resolve their client per call through
-/// `create_composio_client(&config)` rather than holding a pre-baked
+/// `resolve_composio_route(&config).await` rather than holding a pre-baked
 /// handle, so a `Config` is sufficient to instantiate them.
 ///
 /// Config defaults set `composio.mode = "backend"` and stash a
@@ -66,8 +17,7 @@ impl Drop for WorkspaceEnvGuard {
 /// need a session token override the keychain explicitly.
 fn fake_config_arc() -> Arc<crate::config::Config> {
     let tmp = tempfile::tempdir().expect("tempdir for fake_config_arc");
-    let mut config = crate::config::Config::default();
-    config.config_path = tmp.path().join("config.toml");
+    let config = crate::integrations::composio::module_client::test_support::config_in(tmp.path());
     // Leak the tempdir so the path remains valid for the test's lifetime
     // — `Config::config_path` is just used as a lookup key here, not
     // actually written to.
@@ -112,7 +62,7 @@ fn error_text(result: &ToolResult) -> String {
 //
 // These tests guard the bug-fix where every composio agent tool used
 // to hold a pre-baked backend client. After the fix, all five tools
-// resolve the client through `create_composio_client` per call so the
+// resolve the client through `resolve_composio_route` per call so the
 // live `composio.mode` toggle is honoured. Read-shaped tools
 // (list_toolkits, list_connections, list_tools) short-circuit to an
 // empty response in direct mode mirroring the existing ops.rs
@@ -126,6 +76,9 @@ fn direct_mode_config() -> crate::config::Config {
     let tmp = tempfile::tempdir().expect("tempdir for direct_mode_config");
     let mut config = crate::config::Config::default();
     config.config_path = tmp.path().join("config.toml");
+    config.workspace_dir = tmp.path().join("workspace");
+    // Tool/routing fixtures contain fake tokens, with no encrypted store.
+    config.secrets.encrypt = false;
     config.composio.mode = crate::config::schema::COMPOSIO_MODE_DIRECT.to_string();
     config.composio.api_key = Some("test-direct-key".to_string());
     std::mem::forget(tmp);
@@ -134,5 +87,9 @@ fn direct_mode_config() -> crate::config::Config {
 
 #[path = "tools_direct_mode_routing_tests.rs"]
 mod direct_mode_routing_tests;
+#[path = "tools_host_credential_tests.rs"]
+mod host_credential_tests;
 #[path = "tools_metadata_and_sandbox_tests.rs"]
 mod metadata_and_sandbox_tests;
+#[path = "tools_redact_tests.rs"]
+mod redact_tests;

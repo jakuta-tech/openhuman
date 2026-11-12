@@ -1,7 +1,6 @@
-use crate::channels::{traits, Channel, SendMessage};
-use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+use crate::channels::runtime::TestChannel;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
 use tinyinference_llm::message::{AssistantMessage, Message};
@@ -67,25 +66,13 @@ pub(super) use crate::agent::bus::use_real_agent_handler;
 
 pub(super) fn make_workspace() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    // Create minimal workspace files — only the bundled identity prompts
-    // plus a MEMORY.md stand-in for what the archivist would write.
+    // Create minimal workspace files — only the bundled identity prompts.
     std::fs::write(tmp.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
     std::fs::write(
         tmp.path().join("IDENTITY.md"),
         "# Identity\nName: OpenHuman",
     )
     .unwrap();
-    std::fs::write(
-        tmp.path().join("PROFILE.md"),
-        "# User Profile\nName: Test User",
-    )
-    .unwrap();
-    std::fs::write(
-        tmp.path().join("HEARTBEAT.md"),
-        "# Heartbeat\nCheck status.",
-    )
-    .unwrap();
-    std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
     tmp
 }
 
@@ -102,79 +89,7 @@ impl ChatModel<()> for DummyModel {
     }
 }
 
-#[derive(Default)]
-pub(super) struct RecordingChannel {
-    pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
-    pub(super) start_typing_calls: AtomicUsize,
-    pub(super) stop_typing_calls: AtomicUsize,
-}
-
-#[derive(Default)]
-pub(super) struct TelegramRecordingChannel {
-    pub(super) sent_messages: tokio::sync::Mutex<Vec<String>>,
-}
-
-#[async_trait::async_trait]
-impl Channel for TelegramRecordingChannel {
-    fn name(&self) -> &str {
-        "telegram"
-    }
-
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        self.sent_messages
-            .lock()
-            .await
-            .push(format!("{}:{}", message.recipient, message.content));
-        Ok(())
-    }
-
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Channel for RecordingChannel {
-    fn name(&self) -> &str {
-        "test-channel"
-    }
-
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        self.sent_messages
-            .lock()
-            .await
-            .push(format!("{}:{}", message.recipient, message.content));
-        Ok(())
-    }
-
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        self.start_typing_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
+pub(super) type RecordingChannel = TestChannel;
 
 pub(super) struct SlowModel {
     pub(super) delay: Duration,
@@ -353,87 +268,5 @@ impl Tool for MockPriceTool {
         }
 
         Ok(ToolResult::success("BTC is $65,000"))
-    }
-}
-
-pub(super) struct NoopMemory;
-
-#[async_trait::async_trait]
-impl Memory for NoopMemory {
-    fn name(&self) -> &str {
-        "noop"
-    }
-
-    async fn store(
-        &self,
-        _namespace: &str,
-        _key: &str,
-        _content: &str,
-        _category: MemoryCategory,
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn recall(
-        &self,
-        _query: &str,
-        _limit: usize,
-        _opts: crate::memory::RecallOpts<'_>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn get(&self, _namespace: &str, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        Ok(None)
-    }
-
-    async fn list(
-        &self,
-        _namespace: Option<&str>,
-        _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn forget(&self, _namespace: &str, _key: &str) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    async fn namespace_summaries(&self) -> anyhow::Result<Vec<crate::memory::NamespaceSummary>> {
-        Ok(Vec::new())
-    }
-
-    async fn count(&self) -> anyhow::Result<usize> {
-        Ok(0)
-    }
-
-    async fn health_check(&self) -> bool {
-        true
-    }
-}
-
-pub(super) struct AlwaysFailChannel {
-    pub(super) name: &'static str,
-    pub(super) calls: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl Channel for AlwaysFailChannel {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-    ) -> anyhow::Result<()> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        anyhow::bail!("listen boom")
     }
 }

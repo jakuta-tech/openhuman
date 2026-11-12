@@ -1,19 +1,15 @@
 //! The public fetch surface for connected integrations:
 //! [`fetch_connected_integrations`] / [`fetch_connected_integrations_status`]
-//! (cache-fronted, calling [`super::fetch_uncached::fetch_connected_integrations_uncached`]
-//! on a miss) and the just-in-time [`fetch_toolkit_actions`], plus their
-//! small toolkit-membership/description helpers.
+//! (cache-fronted; a miss asks the module's `ListConnectedIntegrations`).
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-use crate::agent::prompts::{ConnectedIntegration, ConnectedIntegrationTool};
 use crate::config::Config;
+use crate::integrations::ConnectedIntegration;
 
-use super::cache::{cache_key, CachedIntegrations, CACHE_GENERATION, INTEGRATIONS_CACHE};
-use super::fetch_uncached::fetch_connected_integrations_uncached;
-use crate::integrations::composio::client::ComposioClient;
-use crate::integrations::composio::ops::should_forward_tags;
+use super::cache::{
+    cache_generation, checked_cache_key, store_fetched_integrations, INTEGRATIONS_CACHE,
+};
 
 /// Fetch the user's active Composio connections and their available
 /// tool actions, returning a prompt-ready summary.
@@ -22,7 +18,7 @@ use crate::integrations::composio::ops::should_forward_tags;
 /// data injected into system prompts — both the agent turn loop and
 /// the debug dump CLI call this function.
 ///
-/// Results are cached process-wide (keyed by config identity) and
+/// Results are cached process-wide (keyed by storage scope and credential identity) and
 /// returned instantly on subsequent calls. The cache is invalidated
 /// when a connection changes (via [`invalidate_connected_integrations_cache`]
 /// or `list_connections` reconciliation), or on process restart.
@@ -67,22 +63,39 @@ pub enum FetchConnectedIntegrationsStatus {
 pub async fn fetch_connected_integrations_status(
     config: &Config,
 ) -> FetchConnectedIntegrationsStatus {
+    // A task that lost its SaaS profile must neither reuse another profile's
+    // snapshot nor request and cache connections under operator credentials.
+    if let Err(error) = crate::storage::current_scope() {
+        tracing::warn!(operation = "fetch", error_kind = ?error.kind(),
+            "[composio][integrations] scope_resolution_refused");
+        return FetchConnectedIntegrationsStatus::Unavailable;
+    }
+    // Composio switched off: nothing to ask. An authoritative empty set also
+    // keeps the first turn from awaiting a hosted round trip.
+    if config.composio.mode.trim() == crate::config::schema::COMPOSIO_MODE_DISABLED {
+        return FetchConnectedIntegrationsStatus::Authoritative(Vec::new());
+    }
     // The offline local token is a core identity, never a TinyHumans backend
     // credential. Asking the hosted integrations endpoint with it yields 401,
     // can race the scheduler gate into signed-out state, and cannot discover a
     // real connection. An authoritative empty set keeps this session local.
-    if config.composio.mode.trim() != crate::config::schema::COMPOSIO_MODE_DIRECT
-        && crate::security::credentials::session_support::get_session_token(config)
+    // A stored API key outranks the local session (`resolve_backend_credential`),
+    // so it still reaches the backend.
+    let local_session_without_api_key = config.composio.mode.trim()
+        != crate::config::schema::COMPOSIO_MODE_DIRECT
+        && !crate::credentials::api_key::has_api_key(config).await
+        && crate::credentials::session_state::get_session_token(config)
+            .await
             .ok()
             .flatten()
-            .is_some_and(|token| {
-                crate::security::credentials::session_support::is_local_session_token(&token)
-            })
-    {
+            .is_some_and(|token| crate::credentials::session_state::is_local_session_token(&token));
+    if local_session_without_api_key {
         return FetchConnectedIntegrationsStatus::Authoritative(Vec::new());
     }
-    let key = cache_key(config);
 
+    let Some(key) = checked_cache_key(config).await else {
+        return FetchConnectedIntegrationsStatus::Unavailable;
+    };
     // A connection event or a divergent list_connections response invalidates
     // this snapshot. Idle time alone must never put a network request on the
     // first-token path.
@@ -99,25 +112,14 @@ pub async fn fetch_connected_integrations_status(
         }
     }
 
-    let generation = CACHE_GENERATION.load(Ordering::SeqCst);
+    let epoch = cache_generation(&key);
+    let generation = epoch.load(Ordering::SeqCst);
     match fetch_connected_integrations_uncached(config).await {
         Some(result) => {
             // Backend was reachable — cache the result (even if empty).
-            if let Ok(mut guard) = INTEGRATIONS_CACHE.write() {
-                if CACHE_GENERATION.load(Ordering::SeqCst) == generation {
-                    guard.insert(
-                        key,
-                        CachedIntegrations {
-                            entries: result.clone(),
-                            cached_at: Instant::now(),
-                        },
-                    );
-                } else {
-                    tracing::debug!(
-                        "[composio][integrations] discarded fetch invalidated in flight"
-                    );
-                    return FetchConnectedIntegrationsStatus::Unavailable;
-                }
+            if !store_fetched_integrations(key, &epoch, generation, result.clone()) {
+                tracing::debug!("[composio][integrations] discarded fetch invalidated in flight");
+                return FetchConnectedIntegrationsStatus::Unavailable;
             }
             FetchConnectedIntegrationsStatus::Authoritative(result)
         }
@@ -129,131 +131,109 @@ pub async fn fetch_connected_integrations_status(
     }
 }
 
-/// The connectable toolkit slugs to surface in the agent prompt, aligned
-/// with the backend's execution gate.
+/// The cache-miss fetch: ask the module for the overview of the live route and
+/// map it to the prompt types.
 ///
-/// Prefers the dynamic catalog's **enabled** entries (openhuman PR #3933 /
-/// backend #1012). The backend gate (`isToolkitConnectable` →
-/// `getProjectList().filter(p => p.enabled)`) and `catalog[].enabled` are
-/// driven by the same project auth-config status, so sourcing membership from
-/// `catalog.filter(enabled)` pins the prompt's advertised set to exactly what
-/// connect/authorize/execute will actually allow — it can't drift even if the
-/// backend later changes how the flat `toolkits` array is projected.
-///
-/// Falls back to the back-compat `toolkits` array when the catalog is absent
-/// (backends predating the dynamic catalog send only `toolkits`); without the
-/// fallback, membership against an old core would collapse to empty and the
-/// agent would lose every integration. Disabled catalog entries are dropped
-/// because the gate would reject them — advertising them would only invite
-/// failed delegations. Slugs are trimmed + lowercased to match downstream
-/// canonicalisation.
-pub(crate) fn connectable_toolkit_slugs(
-    toolkits: &[String],
-    catalog: &[crate::integrations::composio::types::ComposioToolkitCatalogEntry],
-) -> Vec<String> {
-    let normalize = |s: &str| s.trim().to_ascii_lowercase();
-    if catalog.is_empty() {
-        toolkits
-            .iter()
-            .map(|t| normalize(t))
-            .filter(|t| !t.is_empty())
-            .collect()
-    } else {
-        catalog
-            .iter()
-            .filter(|entry| entry.enabled.unwrap_or(false))
-            .map(|entry| normalize(&entry.slug))
-            .filter(|slug| !slug.is_empty())
-            .collect()
-    }
-}
+/// `None` when no route can be built (not signed in) or the module call fails,
+/// so the caller does NOT cache the failure -- a single 5xx during startup must
+/// not hide every integration for the rest of the session.
+#[inline(never)]
+fn fetch_connected_integrations_uncached(
+    config: &Config,
+) -> futures::future::BoxFuture<'_, Option<Vec<ConnectedIntegration>>> {
+    Box::pin(async move {
+        use tinyconnectors_bus::names::methods;
+        use tinyconnectors_bus::{
+            ComposioConnectedIntegrationsMode as Mode, ComposioConnectedIntegrationsResponse,
+            ComposioListConnectedIntegrationsRequest,
+        };
 
-/// Choose the one-line description rendered for a toolkit in the agent
-/// prompt's `## Connected Integrations` block.
-///
-/// Prefers the backend's **dynamic catalog** description (openhuman PR #3933
-/// / backend #1012 — `GET /agent-integrations/composio/toolkits` now returns
-/// a `catalog[]` with per-toolkit metadata) so the orchestrator advertises
-/// what Composio actually offers. Falls back to the hardcoded
-/// `toolkit_description` table when the catalog omits the toolkit or ships an
-/// empty description — i.e. older backends that predate the dynamic catalog,
-/// or project toolkits whose Composio metadata join produced no blurb. Keyed
-/// by lowercased slug to match the canonicalised allowlist.
-pub(crate) fn resolve_toolkit_description(
-    catalog_descriptions: &std::collections::HashMap<String, String>,
-    slug: &str,
-) -> String {
-    catalog_descriptions.get(slug).cloned().unwrap_or_else(|| {
-        crate::integrations::composio::providers::toolkit_description(slug).to_string()
+        let mode = match crate::integrations::composio::client::resolve_composio_route(config).await
+        {
+            Ok(crate::integrations::composio::client::ComposioRoute::Backend) => Mode::Backend,
+            Ok(crate::integrations::composio::client::ComposioRoute::Direct(_)) => Mode::Direct,
+            Err(error) => {
+                tracing::debug!(%error,
+                    "[composio][integrations] no client (not signed in?)");
+                return None;
+            }
+        };
+        match crate::integrations::composio::module_client::call::<
+            _,
+            ComposioConnectedIntegrationsResponse,
+        >(
+            config,
+            methods::LIST_CONNECTED_INTEGRATIONS,
+            ComposioListConnectedIntegrationsRequest { mode },
+        )
+        .await
+        {
+            Ok(resp) => Some(to_prompt_integrations(resp)),
+            Err(error) => {
+                tracing::warn!(?mode, %error,
+                    "[composio][integrations] ListConnectedIntegrations failed");
+                None
+            }
+        }
     })
 }
 
-/// Just-in-time fetch of every available action for a single Composio
-/// toolkit, returned in the [`ConnectedIntegrationTool`] shape the
-/// `integrations_agent` spawn path expects.
-///
-/// Unlike [`fetch_connected_integrations`] (which bulk-fetches every
-/// connected toolkit's tools once per session and caches the result),
-/// this helper is uncached and scoped to a single toolkit — meant to
-/// be called at `integrations_agent` spawn time so the sub-agent's
-/// prompt always reflects the toolkit's current action catalogue.
-///
-/// The filter `starts_with("{TOOLKIT}_")` matches
-/// `fetch_connected_integrations_uncached`'s own namespacing rule so
-/// siblings like `github` / `git` don't leak into each other's buckets.
-///
-/// `tags` narrows the result by Composio action tag (OR semantics). Only
-/// honoured for the GitHub toolkit; passed through to `list_tools` so the
-/// backend can skip the repo-list force-include and return a focused set.
-///
-/// Returns an empty vec when the backend has no actions for the
-/// toolkit (valid steady state for a freshly-authorised integration
-/// whose catalogue hasn't been published yet). Returns `Err` only for
-/// transport / auth failures the caller should surface to the user.
-pub async fn fetch_toolkit_actions(
-    config: &Config,
-    client: &ComposioClient,
-    toolkit: &str,
-    tags: Option<&[String]>,
-) -> anyhow::Result<Vec<ConnectedIntegrationTool>> {
-    let toolkit_slug = toolkit.trim();
-    if toolkit_slug.is_empty() {
-        anyhow::bail!("fetch_toolkit_actions: toolkit must not be empty");
-    }
-    let effective_tags = if should_forward_tags(Some(&[toolkit_slug.to_string()])) {
-        tags
-    } else {
-        None
+/// Map the module's overview to the agent prompt's types. The unlock text for a
+/// gated action is product copy, so it is built here from the scope.
+pub(crate) fn to_prompt_integrations(
+    resp: tinyconnectors_bus::ComposioConnectedIntegrationsResponse,
+) -> Vec<ConnectedIntegration> {
+    use crate::agent::prompts::{
+        ConnectedIntegrationTool, GatedIntegrationTool, IntegrationConnection,
     };
-    tracing::debug!(toolkit = %toolkit_slug, ?effective_tags, "[composio] fetch_toolkit_actions");
-    let resp = client
-        .list_tools(Some(&[toolkit_slug.to_string()]), effective_tags)
-        .await
-        .map_err(|e| anyhow::anyhow!("list_tools failed for toolkit `{toolkit_slug}`: {e}"))?;
-    let action_prefix = format!("{}_", toolkit_slug.to_uppercase());
-    // Apply curated whitelist + user scope so spawn-time tool
-    // discovery agrees with the bulk path and the meta-tool layer.
-    let pref = crate::integrations::composio::ops::load_user_scope_pref(config, toolkit_slug).await;
-    let actions: Vec<ConnectedIntegrationTool> = resp
-        .tools
+    resp.integrations
         .into_iter()
-        .filter(|t| t.function.name.starts_with(&action_prefix))
-        .filter(|t| {
-            crate::integrations::composio::providers::is_action_visible_with_pref(
-                &t.function.name,
-                &pref,
-            )
+        .map(|i| {
+            let toolkit = i.toolkit;
+            ConnectedIntegration {
+                tools: i
+                    .tools
+                    .into_iter()
+                    .map(|t| ConnectedIntegrationTool {
+                        name: t.name,
+                        description: t.description,
+                        parameters: t.parameters,
+                    })
+                    .collect(),
+                gated_tools: i
+                    .gated_tools
+                    .into_iter()
+                    .map(|g| {
+                        let scope = g.required_scope.as_str();
+                        GatedIntegrationTool {
+                            name: g.name,
+                            description: g.description,
+                            required_scope: scope.to_string(),
+                            unlock_paths: vec![format!(
+                                "the user enables it themselves in \
+                                 Connections → {toolkit} → {scope}"
+                            )],
+                        }
+                    })
+                    .collect(),
+                connections: i
+                    .connections
+                    .into_iter()
+                    .map(|c| IntegrationConnection {
+                        connection_id: c.connection_id,
+                        label: c.label,
+                        is_default: c.is_default,
+                    })
+                    .collect(),
+                description: i.description,
+                connected: i.connected,
+                non_active_status: i.non_active_status,
+                toolkit,
+            }
         })
-        .map(|t| ConnectedIntegrationTool {
-            name: t.function.name,
-            description: t.function.description.unwrap_or_default(),
-            parameters: t.function.parameters,
-        })
-        .collect();
-    tracing::debug!(
-        toolkit = %toolkit_slug,
-        action_count = actions.len(),
-        "[composio] fetch_toolkit_actions: done"
-    );
-    Ok(actions)
+        .collect()
 }
+
+#[cfg(test)]
+#[path = "fetch_tests.rs"]
+mod tests;

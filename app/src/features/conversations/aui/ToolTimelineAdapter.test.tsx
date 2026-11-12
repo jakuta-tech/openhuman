@@ -257,15 +257,15 @@ describe('ToolTimelineAdapter — subagent rendering', () => {
 describe('ToolTimelineAdapter — worker thread ref status propagation', () => {
   const WORKER_REF_DETAIL = `summary text\n[worker_thread_ref]\n${JSON.stringify({
     thread_id: 't-worker-1',
-    label: 'researcher',
-    agent_id: 'researcher',
+    label: 'code_executor',
+    agent_id: 'code_executor',
     task_id: 'task-42',
   })}\n[/worker_thread_ref]`;
 
   function entryWithStatus(status: ToolTimelineEntry['status']): ToolTimelineEntry {
     return {
-      id: `tid:subagent:task-42:researcher:${status}`,
-      name: 'subagent:researcher',
+      id: `tid:subagent:task-42:code_executor:${status}`,
+      name: 'subagent:code_executor',
       round: 1,
       seq: 0,
       status,
@@ -299,12 +299,12 @@ describe('ToolTimelineAdapter — compact chat mode (onViewDetails)', () => {
   const entries: ToolTimelineEntry[] = [
     {
       id: 'tl-1',
-      name: 'agent_prepare_context',
+      name: 'read_file',
       round: 1,
       seq: 0,
       status: 'success',
-      detail: 'fetch X',
-      result: 'Prepared context from 3 sources.',
+      detail: 'notes.md',
+      result: 'Read 3 lines.',
     },
     {
       id: 'sa-1',
@@ -394,6 +394,36 @@ describe('ToolTimelineAdapter — renders the processing transcript inline', () 
     );
     expect(screen.getByTestId('processing-transcript')).toBeInTheDocument();
     expect(screen.getByText('Let me check that file.')).toBeInTheDocument();
+  });
+
+  it('shows an available tool-result diagnostic for unknown failures in the processing transcript', () => {
+    const entries: ToolTimelineEntry[] = [
+      {
+        id: 'failed-tool',
+        name: 'run_code',
+        round: 1,
+        seq: 1,
+        status: 'error',
+        result: 'Process exited with status 127: command not found.',
+        failure: {
+          class: 'Unknown',
+          category: 'Permanent',
+          recoverable: false,
+          causePlain: 'Generic failure.',
+          nextAction: 'Try again.',
+        },
+      },
+    ];
+    render(
+      <ToolTimelineAdapter
+        entries={entries}
+        transcript={[{ kind: 'toolCall', round: 1, seq: 1, callId: 'failed-tool' }]}
+      />
+    );
+
+    const card = screen.getByTestId('assistant-ui-tool-failure');
+    expect(card).toHaveTextContent('Process exited with status 127: command not found.');
+    expect(card).not.toHaveTextContent('Generic failure.');
   });
 
   it('falls back to the tool-row list when no transcript is present', () => {

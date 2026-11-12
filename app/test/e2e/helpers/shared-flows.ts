@@ -6,9 +6,12 @@
  * All navigation uses browser.execute() with window.location.hash
  * because sidebar nav buttons are icon-only (aria-label, no text content).
  */
+import { getRequestLog } from '../mock-server';
 import { waitForAppReady, waitForAuthBootstrap as waitForAuthenticatedCore } from './app-helpers';
+import { callOpenhumanRpc } from './core-rpc';
 import { triggerAuthDeepLink } from './deep-link-helpers';
 import {
+  clickButton,
   clickText,
   dumpAccessibilityTree,
   textExists,
@@ -16,6 +19,29 @@ import {
   waitForWindowVisible,
 } from './element-helpers';
 import { supportsExecuteScript } from './platform';
+
+function safeRpcErrorSummary(result: { error?: string } | null) {
+  if (typeof result?.error !== 'string') return null;
+  return result.error
+    .replace(/https?:\/\/[^\s)]+/gi, '<url>')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '<email>')
+    .replace(/\beyJ[A-Z0-9._-]+/gi, '<token>')
+    .replace(/\b[A-Z0-9_-]{32,}\b/gi, '<redacted>')
+    .replace(/\/(?:[^\s,;]+\/)*[^\s,;]+/g, '<path>')
+    .slice(0, 160);
+}
+
+function safeRpcFailureKind(result: { ok?: boolean; error?: string } | null) {
+  if (!result || result.ok) return null;
+  const message = (result.error ?? '').toLowerCase();
+  if (/timed out|timeout|deadline/.test(message)) return 'timeout';
+  if (/connection refused|tcp connect|connection|connect|socket|network/.test(message))
+    return 'transport';
+  if (/\b401\b|unauthorized/.test(message)) return 'unauthorized';
+  if (/method not found|unknown method/.test(message)) return 'method_not_found';
+  if (/invalid.*params|bad request/.test(message)) return 'invalid_request';
+  return result.error ? 'rpc_error' : 'empty_error';
+}
 
 // ---------------------------------------------------------------------------
 // Accounts page helpers
@@ -145,16 +171,14 @@ async function clickFirstMatch(candidates, timeout = 5_000) {
 const HASH_TO_SIDEBAR_LABEL = {
   '/chat': 'Chat',
   '/human': 'Human',
-  '/brain': 'Brain',
   '/connections': 'Connections',
   '/settings': 'Settings',
 };
 
 /**
- * Routes that AppRoutes.tsx serves via <Navigate replace>. Navigating to the
- * key lands the router on the value, so the hash-settle wait must expect the
- * resolved target rather than the requested route. Keep in sync with
- * app/src/AppRoutes.tsx.
+ * Routes that AppRoutes.tsx serves via <Navigate replace>. A route can redirect
+ * through another retired route, so resolve the full chain before waiting for
+ * the final hash. Keep in sync with app/src/AppRoutes.tsx.
  */
 const HASH_REDIRECTS = {
   '/home': '/chat',
@@ -168,7 +192,9 @@ const HASH_REDIRECTS = {
   '/settings/features': '/settings',
   '/settings/screen-intelligence': '/settings',
   '/settings/screen-awareness-debug': '/settings',
-  '/settings/mascot': '/settings/personality#face',
+  '/settings/mascot': '/settings/face',
+  '/settings/notifications': '/settings/account',
+  '/settings/tools': '/connections?tab=agent-tools',
   '/settings/composio-triggers': '/connections?tab=composio-key',
   '/settings/autonomy': '/settings/agent-access',
   '/settings/composio-routing': '/connections?tab=composio-key',
@@ -180,11 +206,26 @@ const HASH_REDIRECTS = {
   '/settings/llm': '/connections?tab=llm',
   '/settings/voice': '/connections?tab=voice',
   '/settings/search': '/connections?tab=search',
+  // Memory v2: the retired Brain page and the v1 memory settings panels all
+  // land on a chip of the Memory page (Connections → Memory, `?brain=`).
+  '/brain': '/connections?tab=brain',
+  '/settings/intelligence': '/connections?tab=brain',
+  '/settings/memory-engine': '/connections?tab=brain&brain=engine',
+  '/settings/memory-data': '/connections?tab=brain&brain=brain',
+  '/settings/memory-sync': '/connections?tab=brain&brain=brain',
+  '/settings/memory-debug': '/connections?tab=brain&brain=ask',
+  '/settings/tasks': '/connections?tab=brain&brain=ask',
 };
 
 /** Resolve a requested hash to where the router actually settles. */
 function resolveRedirect(normalized) {
-  return HASH_REDIRECTS[normalized] || normalized;
+  let resolved = normalized;
+  const seen = new Set();
+  while (HASH_REDIRECTS[resolved] && !seen.has(resolved)) {
+    seen.add(resolved);
+    resolved = HASH_REDIRECTS[resolved];
+  }
+  return resolved;
 }
 
 function normalizeHash(value) {
@@ -202,7 +243,10 @@ function routeReadySelector(hash) {
     '/settings/privacy': '[data-testid="settings-privacy-panel"]',
     '/settings/migration': '[data-testid="migration-form"]',
     '/settings/voice': '[data-testid="voice-providers-section"]',
-    '/settings/memory-data': '[data-testid="memory-workspace"]',
+    '/connections?tab=brain': '[data-testid="memory-page"]',
+    '/connections?tab=brain&brain=engine': '[data-testid="memory-page"]',
+    '/connections?tab=brain&brain=brain': '[data-testid="memory-page"]',
+    '/connections?tab=brain&brain=ask': '[data-testid="memory-page"]',
     '/settings/recovery-phrase': '[data-testid="recovery-phrase-panel"]',
   };
   return selectors[path] || null;
@@ -226,7 +270,7 @@ async function waitForHashRouteReady(hash, options = {}) {
   // readyState + the resolved hash (and a route-ready selector when known).
   // A stable but unrelated hash is not evidence of navigation: accepting one
   // masks failed route changes (for example, a test continuing on /chat after
-  // asking to open /brain?tab=sources).
+  // asking to open /connections?tab=brain).
   await browser.waitUntil(
     async () => {
       const res = await browser.execute(
@@ -245,7 +289,8 @@ async function waitForHashRouteReady(hash, options = {}) {
       if (res.loading) return false;
       // A known route-ready selector being present is a definitive signal the
       // target panel rendered — accept it regardless of the hash, since routes
-      // can redirect to a different hash (e.g. /settings/memory-data → /brain).
+      // can redirect to a different hash (e.g. /settings/memory-data →
+      // /connections?tab=brain&brain=brain).
       if (res.hasSelector) return true;
       // Otherwise require the resolved target hash. Redirects are accounted
       // for above when computing `expected`.
@@ -814,7 +859,10 @@ export async function completeOnboardingIfVisible(logPrefix = '[E2E]') {
   // Waiting for that snapshot prevents a slow bootstrap from being mistaken
   // for an already-onboarded session when the onboarding button has not
   // mounted yet.
-  await waitForAuthenticatedCore(20_000);
+  // Desktop cold starts can spend most of the core's 60-second startup budget
+  // before the loopback session is installed; auth bootstrap must have the
+  // same budget instead of expiring at the old 20-second default.
+  await waitForAuthenticatedCore(60_000);
   await walkOnboarding(logPrefix);
   const marker = await waitForHomePage(15_000);
   if (marker) return;
@@ -849,38 +897,14 @@ export async function logoutViaSettings(logPrefix = '[E2E]') {
   // renders the buttons.
   await navigateViaHash('/settings/account');
 
-  const loggedOut = await browser.execute(() => {
-    const candidates = ['Log out', 'Logout', 'Sign out'];
-    const allElements = document.querySelectorAll('*');
-    for (const label of candidates) {
-      for (const el of allElements) {
-        const text = el.textContent?.trim() || '';
-        if (text !== label) continue;
-        const clickable = el.closest(
-          'button, [role="button"], a, [class*="MenuItem"]'
-        ) as HTMLElement | null;
-        if (clickable) {
-          clickable.click();
-          return label;
-        }
-        (el as HTMLElement).click();
-        return label;
-      }
-    }
-    return null;
-  });
-
-  if (!loggedOut) {
-    const clicked = await clickFirstMatch(['Log out', 'Logout', 'Sign out'], 10_000);
-    if (!clicked) {
-      const tree = await dumpAccessibilityTree();
-      console.log(`${logPrefix} Logout button not found. Tree:\n`, tree.slice(0, 4000));
-      throw new Error('Could not find logout button in Settings');
-    }
-    console.log(`${logPrefix} Logout clicked via text helper: "${clicked}"`);
-  } else {
-    console.log(`${logPrefix} Logout clicked: "${loggedOut}"`);
+  try {
+    await clickButton('Log out', 10_000);
+  } catch (err) {
+    const tree = await dumpAccessibilityTree();
+    console.log(`${logPrefix} Logout button not found. Tree:\n`, tree.slice(0, 4000));
+    throw new Error('Could not find logout button in Settings', { cause: err });
   }
+  console.log(`${logPrefix} Logout clicked through the account action button`);
 
   await browser.pause(2_000);
 
@@ -939,7 +963,58 @@ export async function performFullLogin(
   await waitForWindowVisible(25_000);
   await waitForWebView(15_000);
   await waitForAppReady(15_000);
-  await waitForAuthenticatedCore(15_000);
+  // The embedded core's startup budget is 60 seconds, and OAuth readiness
+  // waits for that core before installing the session. Keep this E2E wait
+  // within the product's cold-start budget instead of failing while the
+  // BootCheckGate is still bringing the core up.
+  try {
+    await waitForAuthenticatedCore(60_000);
+  } catch (error) {
+    // Report only endpoint names, never request bodies or credentials. This
+    // distinguishes a core-readiness timeout from a backend auth request that
+    // reached the mock but failed to complete.
+    const authRequests = getRequestLog()
+      .filter(entry => typeof entry.url === 'string' && entry.url.startsWith('/auth/'))
+      .map(entry => `${entry.method} ${entry.url.split('?')[0]} -> ${entry.status ?? 'pending'}`);
+    const coreState = await browser
+      .execute(() => {
+        const win = window as unknown as { __OPENHUMAN_CORE_STATE__?: () => any };
+        const state = win.__OPENHUMAN_CORE_STATE__?.();
+        return {
+          isReady: state?.isReady ?? null,
+          isBootstrapping: state?.isBootstrapping ?? null,
+          hasSessionToken: Boolean(state?.snapshot?.sessionToken),
+          hasAuthUser: Boolean(state?.snapshot?.auth?.userId),
+          authStoreFailureKind:
+            (window as unknown as { __OPENHUMAN_E2E_AUTH_STORE_FAILURE__?: string })
+              .__OPENHUMAN_E2E_AUTH_STORE_FAILURE__ ?? null,
+        };
+      })
+      .catch(() => null);
+    const [sessionState, sessionToken] = await Promise.all([
+      callOpenhumanRpc('openhuman.auth_get_state').catch(() => null),
+      callOpenhumanRpc('openhuman.auth_get_session_token').catch(() => null),
+    ]);
+    const stateValue = sessionState?.result?.value ?? sessionState?.result;
+    const tokenValue = sessionToken?.result?.value ?? sessionToken?.result;
+    const sessionRpc = {
+      stateOk: sessionState?.ok ?? false,
+      authenticated: stateValue?.isAuthenticated ?? null,
+      credential: stateValue?.credential ?? null,
+      tokenOk: sessionToken?.ok ?? false,
+      hasStoredToken: Boolean(tokenValue?.token),
+      stateHttpStatus: sessionState?.httpStatus ?? null,
+      stateErrorKind: safeRpcFailureKind(sessionState),
+      stateErrorSummary: safeRpcErrorSummary(sessionState),
+      tokenHttpStatus: sessionToken?.httpStatus ?? null,
+      tokenErrorKind: safeRpcFailureKind(sessionToken),
+      tokenErrorSummary: safeRpcErrorSummary(sessionToken),
+    };
+    console.error(
+      `${logPrefix} auth bootstrap failed; mock auth endpoints=${JSON.stringify(authRequests)}; core state=${JSON.stringify(coreState)}; session RPC=${JSON.stringify(sessionRpc)}`
+    );
+    throw error;
+  }
 
   await walkOnboarding(logPrefix);
 

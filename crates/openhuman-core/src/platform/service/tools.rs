@@ -47,6 +47,9 @@ macro_rules! config_tool {
             fn name(&self) -> &str {
                 $name
             }
+            fn exposure(&self) -> tinytools::ToolExposure {
+                tinytools::ToolExposure::Deferred
+            }
             fn description(&self) -> &str {
                 $desc
             }
@@ -120,6 +123,10 @@ impl DaemonHostPrefsSetTool {
 
 #[async_trait]
 impl Tool for DaemonHostPrefsSetTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "daemon_host_prefs_set"
     }
@@ -158,6 +165,10 @@ pub struct ServiceRestartTool;
 
 #[async_trait]
 impl Tool for ServiceRestartTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "service_restart"
     }
@@ -195,6 +206,10 @@ pub struct ServiceShutdownTool;
 
 #[async_trait]
 impl Tool for ServiceShutdownTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "service_shutdown"
     }
@@ -226,6 +241,23 @@ impl Tool for ServiceShutdownTool {
             "service_shutdown"
         )
     }
+}
+
+/// Build this domain's tools in their persisted catalogue order.
+pub(crate) fn registered_tools(
+    config: std::sync::Arc<crate::config::Config>,
+) -> Vec<Box<dyn tinytools::Tool>> {
+    vec![
+        Box::new(ServiceStatusTool::new(config.clone())),
+        Box::new(DaemonHostPrefsGetTool::new(config.clone())),
+        Box::new(ServiceStartTool::new(config.clone())),
+        Box::new(ServiceStopTool::new(config.clone())),
+        Box::new(ServiceRestartTool),
+        Box::new(ServiceShutdownTool),
+        Box::new(ServiceInstallTool::new(config.clone())),
+        Box::new(ServiceUninstallTool::new(config.clone())),
+        Box::new(DaemonHostPrefsSetTool::new(config.clone())),
+    ]
 }
 
 #[cfg(test)]

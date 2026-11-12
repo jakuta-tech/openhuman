@@ -1,4 +1,4 @@
-import { Check, ChevronRight, Info, MessageSquare } from 'lucide-react';
+import { Brain, Check, ChevronRight, Info, MessageSquare } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
@@ -11,7 +11,6 @@ import {
   type ComposioToolkitMeta,
   KNOWN_COMPOSIO_TOOLKITS,
 } from '../components/composio/toolkitMeta';
-import DesktopConnectionPage from '../components/desktop/DesktopConnectionPage';
 import EmptyStateCard from '../components/EmptyStateCard';
 import { ToastContainer } from '../components/intelligence/Toast';
 import PageSectionHeader from '../components/layout/PageSectionHeader';
@@ -20,9 +19,10 @@ import { SidebarContent } from '../components/layout/shell/SidebarSlot';
 import TwoPaneNav from '../components/layout/TwoPaneNav';
 import { SettingsLayoutProvider } from '../components/settings/layout/SettingsLayoutContext';
 import SettingsTabbedPage from '../components/settings/layout/SettingsTabbedPage';
-import BrowserConnectionsPanel from '../components/settings/panels/BrowserConnectionsPanel';
 import ComposioPanel from '../components/settings/panels/ComposioPanel';
+import ComputerPanel, { type ComputerSection } from '../components/settings/panels/ComputerPanel';
 import EmbeddingsPanel from '../components/settings/panels/EmbeddingsPanel';
+import LiveVoicePanel from '../components/settings/panels/LiveVoicePanel';
 import LlmConnectionsPanel from '../components/settings/panels/LlmConnectionsPanel';
 import SearchPanel from '../components/settings/panels/SearchPanel';
 import ToolsPanel from '../components/settings/panels/ToolsPanel';
@@ -43,12 +43,10 @@ import {
 } from '../components/skills/skillIcons';
 import SkillSearchBar from '../components/skills/SkillSearchBar';
 import SkillsPage from '../components/skills/SkillsPage';
-import VoiceSetupModal from '../components/skills/VoiceSetupModal';
 import { Alert, AlertDescription } from '../components/ui/Alert';
 import Badge, { type BadgeVariant } from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
-import { useVoiceSkillStatus } from '../features/voice/useVoiceSkillStatus';
 import { useChannelDefinitions } from '../hooks/useChannelDefinitions';
 import { useAgentReadyComposioToolkits, useComposioIntegrations } from '../lib/composio/hooks';
 import { canonicalizeComposioToolkitSlug } from '../lib/composio/toolkitSlug';
@@ -65,6 +63,7 @@ import type { ToastNotification } from '../types/intelligence';
 import { IS_DEV } from '../utils/config';
 import { isLocalSessionToken } from '../utils/localSession';
 import { openhumanComposioGetMode } from '../utils/tauriCommands';
+import Memory from './Memory';
 
 /** Small inline icon helper for the Connections sidebar nav. */
 const navIcon = (d: string) => (
@@ -480,16 +479,17 @@ type ConnectionsTab =
   | 'channels'
   | 'mcp'
   | 'skills'
+  | 'brain'
   | 'agent-tools'
   | 'llm'
   | 'voice'
+  | 'voice-agents'
   | 'embeddings'
   | 'search'
-  | 'browser'
+  | 'computer'
   | 'usage'
   | 'composio-key'
-  | 'wallet'
-  | 'desktop';
+  | 'wallet';
 
 /**
  * Tabs that render a relocated settings panel inside the shared card surface.
@@ -526,26 +526,26 @@ const SELF_HEADER_TABS: ReadonlySet<ConnectionsTab> = new Set<ConnectionsTab>([
   'agent-tools',
   'llm',
   'voice',
+  'voice-agents',
   'embeddings',
   'search',
-  'browser',
+  'computer',
   'composio-key',
   'usage',
   'wallet',
-  'desktop',
 ]);
 
 const INTELLIGENCE_TABS: ReadonlySet<ConnectionsTab> = new Set<ConnectionsTab>([
   'agent-tools',
   'llm',
   'voice',
+  'voice-agents',
   'embeddings',
   'search',
-  'browser',
+  'computer',
   'usage',
   'composio-key',
   'wallet',
-  'desktop',
 ]);
 
 export default function Skills() {
@@ -567,16 +567,17 @@ export default function Skills() {
       raw === 'channels' ||
       raw === 'mcp' ||
       raw === 'skills' ||
+      raw === 'brain' ||
       raw === 'agent-tools' ||
       raw === 'llm' ||
       raw === 'voice' ||
+      raw === 'voice-agents' ||
       raw === 'embeddings' ||
       raw === 'search' ||
-      raw === 'browser' ||
+      raw === 'computer' ||
       raw === 'usage' ||
       raw === 'composio-key' ||
-      raw === 'wallet' ||
-      raw === 'desktop'
+      raw === 'wallet'
     )
       return raw;
     // Legacy back-compat aliases
@@ -584,14 +585,39 @@ export default function Skills() {
     if (raw === 'messaging') return 'channels';
     if (raw === 'tools') return 'mcp';
     if (raw === 'explorer') return 'skills';
+    // Live voice agents: singular and feature-name spellings.
+    if (raw === 'voice-agent' || raw === 'live-voice') return 'voice-agents';
+    // Browser and Desktop are sub-tabs of Computer now.
+    if (raw === 'browser' || raw === 'desktop') return 'computer';
     // Default landing is the Welcome overview for the Connections page.
     return 'welcome';
   }, [location.search]);
+
+  // `?section=` picks Computer's sub-tab; the legacy `?tab=browser|desktop`
+  // deep links land on the matching one.
+  const computerSection = useMemo<ComputerSection>(() => {
+    const params = new URLSearchParams(location.search);
+    const raw = params.get('section') ?? params.get('tab');
+    return raw === 'browser' || raw === 'models' ? raw : 'desktop';
+  }, [location.search]);
+
+  const handleComputerSection = useCallback(
+    (section: ComputerSection) => {
+      const params = new URLSearchParams(location.search);
+      params.set('tab', 'computer');
+      params.set('section', section);
+      navigate({ pathname: location.pathname, search: `?${params.toString()}` });
+    },
+    [location.pathname, location.search, navigate]
+  );
 
   const handleTabChange = useCallback(
     (tab: ConnectionsTab) => {
       const params = new URLSearchParams(location.search);
       params.set('tab', tab);
+      // Memory's own chip param (and v1's `view`) must not leak into other tabs.
+      params.delete('brain');
+      params.delete('view');
       navigate({ pathname: location.pathname, search: `?${params.toString()}` });
     },
     [location.pathname, location.search, navigate]
@@ -643,8 +669,6 @@ export default function Skills() {
   const [composioModalToolkit, setComposioModalToolkit] = useState<ComposioToolkitMeta | null>(
     null
   );
-  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
-  const voiceStatus = useVoiceSkillStatus();
 
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const addToast = useCallback((toast: Omit<ToastNotification, 'id'>) => {
@@ -923,36 +947,6 @@ export default function Skills() {
         <div className="space-y-2">
           {items.map(item => {
             if (item.kind === 'builtin') {
-              /* v8 ignore start -- BUILT_IN_SKILLS list is empty today; the per-id
-               branches below are retained for the hidden voice skill without
-               dragging the diff-coverage gate down while unreachable. */
-              if (item.id === 'voice-stt') {
-                return (
-                  <UnifiedSkillCard
-                    key={item.id}
-                    icon={item.icon}
-                    title={item.name}
-                    description={item.description}
-                    statusLabel={voiceStatus.statusLabel}
-                    statusColor={voiceStatus.statusColor}
-                    ctaLabel={voiceStatus.ctaLabel}
-                    ctaVariant={voiceStatus.ctaVariant}
-                    testId={`skill-row-${item.id}`}
-                    ctaTestId={`skill-install-${item.id}`}
-                    onCtaClick={() => {
-                      if (
-                        voiceStatus.connectionStatus === 'connected' ||
-                        voiceStatus.connectionStatus === 'connecting' ||
-                        voiceStatus.connectionStatus === 'disconnected'
-                      ) {
-                        navigate(item.route!);
-                        return;
-                      }
-                      setVoiceModalOpen(true);
-                    }}
-                  />
-                );
-              }
               return (
                 <UnifiedSkillCard
                   key={item.id}
@@ -965,7 +959,6 @@ export default function Skills() {
                   onCtaClick={() => navigate(item.route!)}
                 />
               );
-              /* v8 ignore stop */
             }
           })}
         </div>
@@ -1013,6 +1006,13 @@ export default function Skills() {
                     ),
                   },
                   {
+                    // Memory v2: engine, ask, learnings, conversations,
+                    // documents and context (formerly the top-level /brain page).
+                    value: 'brain',
+                    label: t('nav.brain'),
+                    icon: <Brain className="h-4 w-4" aria-hidden />,
+                  },
+                  {
                     // Built-in agent tools, relocated from Settings. (`?tab=tools`
                     // is a legacy alias for MCP, hence the distinct value.)
                     value: 'agent-tools',
@@ -1022,13 +1022,8 @@ export default function Skills() {
                     ),
                   },
                   {
-                    value: 'browser',
-                    label: t('connections.tabs.browser'),
-                    icon: navIcon('M3 5h18v14H3zM3 10h18M9 10v9'),
-                  },
-                  {
-                    value: 'desktop',
-                    label: t('desktop.title'),
+                    value: 'computer',
+                    label: t('computer.title'),
                     icon: navIcon('M4 5h16v11H4zM8 20h8m-4-4v4'),
                   },
                   {
@@ -1063,6 +1058,13 @@ export default function Skills() {
                     label: t('pages.settings.ai.voice'),
                     icon: navIcon(
                       'M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z'
+                    ),
+                  },
+                  {
+                    value: 'voice-agents',
+                    label: t('connections.tabs.voiceAgents'),
+                    icon: navIcon(
+                      'M3 18v-6a9 9 0 0118 0v6M21 19a2 2 0 01-2 2h-1a2 2 0 01-2-2v-3a2 2 0 012-2h3zM3 19a2 2 0 002 2h1a2 2 0 002-2v-3a2 2 0 00-2-2H3z'
                     ),
                   },
                   {
@@ -1148,11 +1150,17 @@ export default function Skills() {
             panels (description, no title; the back button hides because the
             Connections sidebar owns navigation), so they fill the content pane
             and own their scroll directly. */
-        activeTab === 'mcp' || activeTab === 'skills' ? (
+        activeTab === 'mcp' || activeTab === 'skills' || activeTab === 'brain' ? (
           // The MCP and Skills pages own their own header and tab strip, like
           // the LLM page does, so they take the pane whole.
           <div className="h-full p-4">
-            {activeTab === 'mcp' ? <McpServersPage /> : <SkillsPage onToast={addToast} />}
+            {activeTab === 'mcp' ? (
+              <McpServersPage />
+            ) : activeTab === 'brain' ? (
+              <Memory />
+            ) : (
+              <SkillsPage onToast={addToast} />
+            )}
           </div>
         ) : INTELLIGENCE_TABS.has(activeTab) ? (
           // API-keys / provider panels were orphaned flush on the shell — give
@@ -1167,6 +1175,7 @@ export default function Skills() {
               <SettingsLayoutProvider value={{ inTwoPaneShell: true, headerless: true }}>
                 {activeTab === 'llm' && <LlmConnectionsPanel />}
                 {activeTab === 'voice' && <VoiceConnectionsPanel />}
+                {activeTab === 'voice-agents' && <LiveVoicePanel />}
                 {activeTab === 'embeddings' && (
                   <SettingsTabbedPage
                     title={t('pages.settings.ai.embeddings')}
@@ -1181,14 +1190,14 @@ export default function Skills() {
                     <ToolsPanel bare />
                   </SettingsTabbedPage>
                 )}
-                {activeTab === 'browser' && <BrowserConnectionsPanel />}
-                {activeTab === 'search' && (
-                  <SettingsTabbedPage
-                    title={t('settings.search.title')}
-                    description={t('connections.header.search')}>
-                    <SearchPanel embedded />
-                  </SettingsTabbedPage>
+                {activeTab === 'computer' && (
+                  <ComputerPanel
+                    section={computerSection}
+                    onSectionChange={handleComputerSection}
+                  />
                 )}
+                {/* Search owns its page shell (header switch + chip tabs), like LLM. */}
+                {activeTab === 'search' && <SearchPanel />}
                 {activeTab === 'composio-key' && (
                   <SettingsTabbedPage
                     title={t('connections.tabs.composioKey')}
@@ -1199,7 +1208,6 @@ export default function Skills() {
                 {/* Usage owns its page shell (header chip tabs), like LLM. */}
                 {activeTab === 'usage' && <UsagePanel />}
                 {activeTab === 'wallet' && <WalletPanel />}
-                {activeTab === 'desktop' && <DesktopConnectionPage />}
               </SettingsLayoutProvider>
             ) : (
               <>
@@ -1383,10 +1391,6 @@ export default function Skills() {
 
       {channelModalDef && (
         <ChannelSetupModal definition={channelModalDef} onClose={() => setChannelModalDef(null)} />
-      )}
-
-      {voiceModalOpen && (
-        <VoiceSetupModal onClose={() => setVoiceModalOpen(false)} skillStatus={voiceStatus} />
       )}
 
       {composioModalToolkit && (

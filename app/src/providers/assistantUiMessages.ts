@@ -9,7 +9,7 @@ import {
 } from '@assistant-ui/react';
 
 import { parseBubbleSegments } from '../features/conversations/utils/format';
-import { parseMessageImages } from '../lib/attachments';
+import { parseAttachmentReferences, parseMessageImages } from '../lib/attachments';
 import { unwrapToolCallEnvelope } from '../lib/chat/toolCallEnvelope';
 import type { ChatCitation } from '../services/chatService';
 import {
@@ -81,6 +81,10 @@ function persistedFeedback(msg: ThreadMessage): MessageFeedback | undefined {
 
 /** Synthetic id for the live streaming tail. Stable so React reconciles it. */
 export const STREAMING_TAIL_ID = '__openhuman_streaming_tail__';
+
+/** Use the core reply identity from the first token through final persistence. */
+export const streamingMessageId = (requestId?: string) =>
+  requestId ? `agent:${requestId}` : STREAMING_TAIL_ID;
 
 /**
  * Convert one persisted message.
@@ -285,7 +289,9 @@ export function subagentMessages(activity: SubagentActivity): readonly AuiThread
           ? { type: 'incomplete', reason: 'error' }
           : activity.status === 'cancelled'
             ? { type: 'incomplete', reason: 'cancelled' }
-            : { type: 'complete', reason: 'stop' },
+            : activity.status === 'incomplete'
+              ? { type: 'incomplete', reason: 'other' }
+              : { type: 'complete', reason: 'stop' },
     });
   }
   return likes.map((like, index) =>
@@ -561,7 +567,9 @@ function assistantParts(
   for (const [index, item] of transcript.entries()) {
     if (item.kind === 'thinking') {
       if (item.text.trim().length > 0) {
-        parts.push(reasoningPart(item.text, item.startedAt, item.endedAt));
+        parts.push(
+          reasoningPart(item.text, item.startedAt ?? undefined, item.endedAt ?? undefined)
+        );
       }
       continue;
     }
@@ -693,7 +701,26 @@ function mergedAssistantText(messages: readonly ThreadMessage[]): string {
   return texts.join('\n\n');
 }
 
+const mergedRunCache = new WeakMap<
+  ThreadMessage,
+  { rows: readonly ThreadMessage[]; merged: ThreadMessage }
+>();
+
 function mergeAssistantRun(messages: readonly ThreadMessage[]): ThreadMessage {
+  const firstRow = messages[0];
+  const cached = firstRow && mergedRunCache.get(firstRow);
+  if (
+    cached &&
+    cached.rows.length === messages.length &&
+    cached.rows.every((row, index) => row === messages[index])
+  )
+    return cached.merged;
+  const merged = mergeAssistantRunUncached(messages);
+  if (firstRow && messages.length > 1) mergedRunCache.set(firstRow, { rows: messages, merged });
+  return merged;
+}
+
+function mergeAssistantRunUncached(messages: readonly ThreadMessage[]): ThreadMessage {
   if (messages.length === 1) return messages[0];
   const first = messages[0];
   const last = messages[messages.length - 1];
@@ -780,7 +807,8 @@ function mimeTypeFromDataUri(dataUri: string): string {
 }
 
 function userParts(msg: ThreadMessage): ThreadUserMessagePart[] {
-  const parsed = parseMessageImages(msg.content ?? '');
+  const references = parseAttachmentReferences(msg.content ?? '');
+  const parsed = parseMessageImages(references.text);
   const metadata = msg.extraMetadata ?? {};
   const kinds = stringArray(metadata.attachmentKinds);
   const names = stringArray(metadata.attachmentNames);
@@ -790,6 +818,16 @@ function userParts(msg: ThreadMessage): ThreadUserMessagePart[] {
   const parts: ThreadUserMessagePart[] = [];
 
   if (parsed.text.length > 0) parts.push({ type: 'text', text: parsed.text });
+
+  if (references.attachments.length > 0) {
+    // Workspace paths cannot be loaded as browser images. A file chip restores
+    // the attachment's identity without storing preview bytes in the message log.
+    for (const file of references.attachments) {
+      parts.push({ type: 'file', filename: file.name, data: '', mimeType: file.mime });
+    }
+    for (const image of parsed.dataUris) parts.push({ type: 'image', image });
+    return parts;
+  }
 
   if (kinds.length === 0) {
     for (const [index, image] of dataUris.entries()) {
@@ -928,7 +966,8 @@ export function streamingTailMessage(
   streaming: StreamingAssistantState | null,
   timeline: readonly ToolTimelineEntry[] = EMPTY_TIMELINE,
   transcript: readonly ProcessingTranscriptItem[] = EMPTY_TRANSCRIPT,
-  approval: PendingApproval | null = null
+  approval: PendingApproval | null = null,
+  requestId: string | undefined = streaming?.requestId
 ): ThreadMessageLike | null {
   if (!approval && !streaming && timeline.length === 0 && transcript.length === 0) return null;
   let parts = assistantParts('', timeline, transcript, 'live');
@@ -961,14 +1000,16 @@ export function streamingTailMessage(
   // state — the part itself has no status field of its own.
   const hasAwaitingSubagent = timeline.some(entry => entry.subagent?.status === 'awaiting_user');
   return {
-    id: STREAMING_TAIL_ID,
+    id: approval?.detached
+      ? `${STREAMING_TAIL_ID}:approval:${approval.requestId}`
+      : streamingMessageId(requestId),
     role: 'assistant',
     content: parts,
     status:
       approval || hasAwaitingSubagent
         ? { type: 'requires-action', reason: 'interrupt' }
         : { type: 'running' },
-    metadata: { custom: { requestId: streaming?.requestId, streaming: true } },
+    metadata: { custom: { requestId, streaming: true } },
   };
 }
 
@@ -1026,6 +1067,12 @@ export type AssistantUiProjection = {
   pendingApproval?: PendingApproval | null;
   liveTimeline?: readonly ToolTimelineEntry[];
   liveTranscript?: readonly ProcessingTranscriptItem[];
+  /**
+   * The request whose rows `liveTimeline` holds, when known
+   * (`chatRuntime.toolTimelineRequestByThread`). A settled message never
+   * borrows another request's live rows as its trail.
+   */
+  liveTimelineRequestId?: string;
   turnTimelines?: Readonly<Record<string, readonly ToolTimelineEntry[]>>;
   turnTranscripts?: Readonly<Record<string, readonly ProcessingTranscriptItem[]>>;
   /**
@@ -1095,14 +1142,20 @@ export function buildRuntimeMessages(
   const lastVisibleAgentId = [...coalescedMessages]
     .reverse()
     .find(message => message.sender === 'agent' && !message.extraMetadata?.hidden)?.id;
+  // A detached approval (an async sub-agent's) can still be parked after the
+  // turn that surfaced it settled. That turn's retained trail is already shown
+  // by its settled message, so the tail then carries only the approval —
+  // re-rendering the trail beside it would duplicate every tool card.
+  const detachedAfterTurn = projection.isRunning === false && pendingApproval?.detached === true;
   const tail =
     projection.isRunning === false && !pendingApproval
       ? null
       : streamingTailMessage(
-          streaming,
-          projection.liveTimeline ?? EMPTY_TIMELINE,
-          projection.liveTranscript ?? EMPTY_TRANSCRIPT,
-          pendingApproval
+          detachedAfterTurn ? null : streaming,
+          detachedAfterTurn ? EMPTY_TIMELINE : (projection.liveTimeline ?? EMPTY_TIMELINE),
+          detachedAfterTurn ? EMPTY_TRANSCRIPT : (projection.liveTranscript ?? EMPTY_TRANSCRIPT),
+          pendingApproval,
+          detachedAfterTurn ? undefined : (projection.liveRequestId ?? streaming?.requestId)
         );
   // While the tail stands for the live turn, that turn's own persisted rows
   // (the reply appended before `turnSettled`, or segments delivered mid-turn)
@@ -1148,12 +1201,22 @@ export function buildRuntimeMessages(
     // Not while a gate is parked: the tail below is minted unconditionally in
     // that case and would emit the same rows a second time, and a repeated
     // `toolCallId` throws inside assistant-ui rather than dropping a row.
+    // Nor when those rows are provably another turn's: a reply that settled
+    // with no `inference_start` of its own (a background delivery) otherwise
+    // showed the previous turn's tool cards a second time under itself.
+    const liveRowsAreForeign =
+      projection.liveTimelineRequestId !== undefined &&
+      requestId !== undefined &&
+      projection.liveTimelineRequestId !== requestId;
     const useSettledLiveFallback =
       projection.isRunning === false &&
-      !pendingApproval &&
+      // A detached approval's tail carries none of these rows (see
+      // `detachedAfterTurn`), so the settled message keeps them.
+      (!pendingApproval || detachedAfterTurn) &&
       msg.id === lastVisibleAgentId &&
       !persistedTimeline &&
-      !persistedTranscript;
+      !persistedTranscript &&
+      !liveRowsAreForeign;
     out.push(
       toThreadMessageLike(
         msg,

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn apply_agent_settings_rejects_out_of_range_timeout() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
     let original = cfg.agent.agent_timeout_secs;
@@ -12,7 +12,7 @@ async fn apply_agent_settings_rejects_out_of_range_timeout() {
         &mut cfg,
         AgentSettingsPatch {
             agent_timeout_secs: Some(0),
-            chat_agent_id: None,
+            ..AgentSettingsPatch::default()
         },
     )
     .await
@@ -24,7 +24,7 @@ async fn apply_agent_settings_rejects_out_of_range_timeout() {
         &mut cfg,
         AgentSettingsPatch {
             agent_timeout_secs: Some(99_999),
-            chat_agent_id: None,
+            ..AgentSettingsPatch::default()
         },
     )
     .await
@@ -37,7 +37,7 @@ async fn apply_agent_settings_rejects_out_of_range_timeout() {
 
 #[tokio::test]
 async fn apply_agent_settings_none_leaves_timeout_unchanged() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
     cfg.agent.agent_timeout_secs = 250;
@@ -51,7 +51,7 @@ async fn apply_agent_settings_none_leaves_timeout_unchanged() {
 
 #[tokio::test]
 async fn apply_agent_settings_rejects_unknown_chat_agent_id() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
 
@@ -71,7 +71,7 @@ async fn apply_agent_settings_rejects_unknown_chat_agent_id() {
 
 #[tokio::test]
 async fn apply_agent_settings_blank_chat_agent_id_clears_and_persists_override() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
     cfg.agent.chat_agent_id = Some("researcher".into());
@@ -103,7 +103,7 @@ async fn apply_agent_settings_blank_chat_agent_id_clears_and_persists_override()
 
 #[tokio::test]
 async fn apply_agent_settings_rejects_a_mixed_patch_without_mutating_config() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
     let original_timeout = cfg.agent.agent_timeout_secs;
@@ -113,6 +113,7 @@ async fn apply_agent_settings_rejects_a_mixed_patch_without_mutating_config() {
         AgentSettingsPatch {
             agent_timeout_secs: Some(300),
             chat_agent_id: Some("typoed_agent".into()),
+            ..AgentSettingsPatch::default()
         },
     )
     .await
@@ -127,7 +128,7 @@ async fn apply_agent_settings_rejects_a_mixed_patch_without_mutating_config() {
 
 #[tokio::test]
 async fn apply_agent_paths_valid_abs_path_persists_override_and_recomputes() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     // Ensure no env override is interfering.
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
@@ -141,6 +142,7 @@ async fn apply_agent_paths_valid_abs_path_persists_override_and_recomputes() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some(new_dir.to_string_lossy().to_string()),
+            files_dir: None,
         },
     )
     .await
@@ -160,7 +162,7 @@ async fn apply_agent_paths_valid_abs_path_persists_override_and_recomputes() {
 
 #[tokio::test]
 async fn apply_agent_paths_rejects_relative_path() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
@@ -171,6 +173,7 @@ async fn apply_agent_paths_rejects_relative_path() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some("relative/projects".into()),
+            files_dir: None,
         },
     )
     .await
@@ -182,7 +185,7 @@ async fn apply_agent_paths_rejects_relative_path() {
 
 #[tokio::test]
 async fn apply_agent_paths_rejects_action_dir_equal_to_workspace() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
@@ -194,6 +197,7 @@ async fn apply_agent_paths_rejects_action_dir_equal_to_workspace() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some(workspace.to_string_lossy().to_string()),
+            files_dir: None,
         },
     )
     .await
@@ -205,7 +209,7 @@ async fn apply_agent_paths_rejects_action_dir_equal_to_workspace() {
 
 #[tokio::test]
 async fn apply_agent_paths_empty_input_clears_override() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
@@ -220,6 +224,7 @@ async fn apply_agent_paths_empty_input_clears_override() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some("   ".into()),
+            files_dir: None,
         },
     )
     .await
@@ -236,7 +241,7 @@ async fn apply_agent_paths_empty_input_clears_override() {
 
 #[tokio::test]
 async fn apply_agent_paths_auto_creates_missing_directory() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
@@ -249,6 +254,7 @@ async fn apply_agent_paths_auto_creates_missing_directory() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some(missing.to_string_lossy().to_string()),
+            files_dir: None,
         },
     )
     .await
@@ -260,7 +266,7 @@ async fn apply_agent_paths_auto_creates_missing_directory() {
 
 #[tokio::test]
 async fn apply_agent_paths_rejects_existing_file() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
@@ -273,6 +279,7 @@ async fn apply_agent_paths_rejects_existing_file() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some(file.to_string_lossy().to_string()),
+            files_dir: None,
         },
     )
     .await
@@ -284,7 +291,7 @@ async fn apply_agent_paths_rejects_existing_file() {
 
 #[tokio::test]
 async fn apply_agent_paths_env_set_reports_source_env() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     let env_dir = tmp.path().join("env-pinned");
     std::fs::create_dir_all(&env_dir).unwrap();
@@ -302,6 +309,7 @@ async fn apply_agent_paths_env_set_reports_source_env() {
         &mut cfg,
         AgentPathsPatch {
             action_dir: Some(user_dir.to_string_lossy().to_string()),
+            files_dir: None,
         },
     )
     .await
@@ -315,6 +323,101 @@ async fn apply_agent_paths_env_set_reports_source_env() {
     unsafe {
         std::env::remove_var("OPENHUMAN_ACTION_DIR");
     }
+}
+
+/// The action_dir edit, expected to be refused without storing an override.
+async fn action_dir_rejected(cfg: &mut Config, value: &std::path::Path) -> String {
+    let err = apply_agent_paths_settings(
+        cfg,
+        AgentPathsPatch {
+            action_dir: Some(value.to_string_lossy().to_string()),
+            files_dir: None,
+        },
+    )
+    .await
+    .expect_err("action_dir must be rejected");
+    assert!(
+        cfg.action_dir_override.is_none(),
+        "a rejected value is not stored"
+    );
+    err
+}
+
+/// TS-E2E-021: the agent's working folder becomes its read-write root, so a
+/// credential store, an OS directory or a symlink to one must be refused.
+#[tokio::test]
+async fn apply_agent_paths_rejects_a_protected_action_dir() {
+    let _g = ENV_LOCK.lock().await;
+    unsafe {
+        std::env::remove_var("OPENHUMAN_ACTION_DIR");
+    }
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let ssh = tmp.path().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+
+    let err = action_dir_rejected(&mut cfg, &ssh).await;
+    assert!(err.contains("protected"), "{err}");
+    #[cfg(unix)]
+    {
+        let err = action_dir_rejected(&mut cfg, std::path::Path::new("/etc")).await;
+        assert!(err.contains("protected"), "{err}");
+        let link = tmp.path().join("projects-link");
+        std::os::unix::fs::symlink(&ssh, &link).unwrap();
+        let err = action_dir_rejected(&mut cfg, &link).await;
+        assert!(err.contains("protected"), "{err}");
+    }
+}
+
+/// TS-E2E-021: a folder inside the OpenHuman data folder holds internal state
+/// and must not become the agent's working folder.
+#[tokio::test]
+async fn apply_agent_paths_rejects_an_action_dir_inside_the_data_folder() {
+    let _g = ENV_LOCK.lock().await;
+    unsafe {
+        std::env::remove_var("OPENHUMAN_ACTION_DIR");
+    }
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let inside = cfg.workspace_dir.join("vault");
+
+    let err = action_dir_rejected(&mut cfg, &inside).await;
+    assert!(err.contains("OpenHuman data folder"), "{err}");
+    assert!(!inside.exists(), "nothing is created for a rejected value");
+}
+
+/// An `OPENHUMAN_WORKSPACE` profile keeps `config.toml` and its credential
+/// files beside the workspace, so the profile folder itself (or any folder
+/// above it) must not become the agent's working folder. A sibling folder in
+/// the profile reaches none of that state and stays allowed.
+#[tokio::test]
+async fn apply_agent_paths_rejects_an_action_dir_that_contains_the_profile() {
+    let _g = ENV_LOCK.lock().await;
+    unsafe {
+        std::env::remove_var("OPENHUMAN_ACTION_DIR");
+    }
+    let tmp = tempdir().unwrap();
+    let profile = tmp.path().join("profile");
+    let mut cfg = Config::default();
+    cfg.workspace_dir = profile.join("workspace");
+    cfg.config_path = profile.join("config.toml");
+    std::fs::create_dir_all(&cfg.workspace_dir).unwrap();
+
+    for root in [profile.as_path(), tmp.path()] {
+        let err = action_dir_rejected(&mut cfg, root).await;
+        assert!(err.contains("OpenHuman data folder"), "{err}");
+    }
+    let beside = profile.join("projects");
+    apply_agent_paths_settings(
+        &mut cfg,
+        AgentPathsPatch {
+            action_dir: Some(beside.to_string_lossy().to_string()),
+            files_dir: None,
+        },
+    )
+    .await
+    .expect("a folder beside the profile's state is allowed");
+    assert_eq!(cfg.action_dir_override.as_deref(), Some(beside.as_path()));
 }
 
 // --- #3353 regression tests -------------------------------------------------
@@ -381,7 +484,7 @@ fn redact_home_replaces_home_prefix_and_passes_through_others() {
 async fn ensure_agent_dirs_creates_missing_action_dir_and_trusted_root() {
     use crate::security::TrustedAccess;
 
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.lock().await;
     let tmp = tempdir().unwrap();
     // Point the default projects home at the tempdir so the helper doesn't touch
     // the real `~/OpenHuman/projects`.
@@ -472,4 +575,53 @@ fn ensure_usable_cwd_errors_when_uncreatable() {
         msg.contains("could not be created"),
         "unexpected error: {msg}"
     );
+}
+
+#[tokio::test]
+async fn apply_agent_settings_sets_and_normalizes_tool_dispatcher() {
+    let _g = ENV_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    assert_eq!(
+        cfg.agent.tool_dispatcher, "auto",
+        "JSON/native is the default"
+    );
+
+    apply_agent_settings(
+        &mut cfg,
+        AgentSettingsPatch {
+            tool_dispatcher: Some("  Python ".into()),
+            ..AgentSettingsPatch::default()
+        },
+    )
+    .await
+    .expect("known dispatcher is accepted");
+    assert_eq!(cfg.agent.tool_dispatcher, "python");
+
+    // Omitting the field leaves it alone.
+    apply_agent_settings(&mut cfg, AgentSettingsPatch::default())
+        .await
+        .expect("no-op");
+    assert_eq!(cfg.agent.tool_dispatcher, "python");
+}
+
+#[tokio::test]
+async fn apply_agent_settings_rejects_unknown_tool_dispatcher_without_mutating() {
+    let _g = ENV_LOCK.lock().await;
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let err = apply_agent_settings(
+        &mut cfg,
+        AgentSettingsPatch {
+            agent_timeout_secs: Some(321),
+            tool_dispatcher: Some("cobol".into()),
+            ..AgentSettingsPatch::default()
+        },
+    )
+    .await
+    .expect_err("unknown dispatcher must be rejected");
+    assert!(err.contains("invalid tool_dispatcher"), "unexpected: {err}");
+    assert_eq!(cfg.agent.tool_dispatcher, "auto");
+    assert_ne!(cfg.agent.agent_timeout_secs, 321, "mixed patch is atomic");
 }

@@ -66,13 +66,18 @@
 //! with which it is, and [`sign_payload`] dispatches on the tag rather than on
 //! the chain — so a chain that changes scheme cannot silently sign wrongly.
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tinywallet_bus::names::methods;
 use tinywallet_bus::wire::{
-    DerivedAccount, ExportRequest, ExportedKey, Scheme, SecretMaterial, SignMessageRequest,
+    DeriveMnemonicSeedRequest, DeriveMnemonicSeedResponse, DerivedAccount,
+    EncodeErc20TransferRequest, EncodeErc20TransferResponse, ExportRequest, ExportedKey,
+    GenerateMnemonicRequest, GenerateMnemonicResponse, Scheme, SecretMaterial, SignMessageRequest,
     SignRequest, Signature, SignedTransaction, TransactionSpec,
 };
+use zeroize::Zeroize;
 
-use super::{host, ops, registry};
+use super::{ops, registry};
 use crate::config::Config;
 
 /// Registry id of the module these calls go to.
@@ -145,15 +150,73 @@ pub async fn derive_account(
     config: &Config,
     secret: &SecretMaterial,
 ) -> Result<DerivedAccount, WalletCallError> {
-    let proxy = attested_proxy(config).await?;
     log::debug!(
         "[modules:wallet] derive_account chain={:?} module={MODULE_ID} (confidential)",
         secret.chain
     );
-    proxy
-        .call_confidential(methods::DERIVE_ACCOUNT, (secret.clone(),))
-        .await
-        .map_err(|error| classify(&error))
+    let mut request = secret.clone();
+    let result = call_confidential(config, methods::DERIVE_ACCOUNT, &request).await;
+    request.mnemonic.zeroize();
+    result
+}
+
+/// Generate a recovery phrase inside the attested TinyWallet module.
+///
+/// # Errors
+///
+/// [`WalletCallError`]. The phrase is returned to the host for encryption and
+/// custody, but generation and BIP-39 vocabulary remain module-owned.
+pub async fn generate_mnemonic(
+    config: &Config,
+    word_count: u8,
+) -> Result<GenerateMnemonicResponse, WalletCallError> {
+    call_confidential(
+        config,
+        methods::GENERATE_MNEMONIC,
+        &GenerateMnemonicRequest { word_count },
+    )
+    .await
+}
+
+/// Derive a standard BIP-39 seed inside the attested module.
+///
+/// The caller uses the seed only for OpenHuman's generic storage-key KDF.
+///
+/// # Errors
+///
+/// [`WalletCallError`]. Invalid or unsupported phrases are classified as
+/// [`WalletCallError::InvalidInput`].
+pub async fn derive_mnemonic_seed(
+    config: &Config,
+    mnemonic: String,
+) -> Result<DeriveMnemonicSeedResponse, WalletCallError> {
+    let mut request = DeriveMnemonicSeedRequest { mnemonic };
+    let result = call_confidential(config, methods::DERIVE_MNEMONIC_SEED, &request).await;
+    request.mnemonic.zeroize();
+    result
+}
+
+/// Encode ERC-20 transfer calldata with the module-owned ABI implementation.
+///
+/// # Errors
+///
+/// Returns [`WalletCallError`] if the module is unavailable or rejects the
+/// recipient or base-unit amount.
+pub async fn encode_erc20_transfer(
+    config: &Config,
+    to_address: &str,
+    amount_raw: &str,
+) -> Result<String, WalletCallError> {
+    let response: EncodeErc20TransferResponse = call(
+        config,
+        methods::ENCODE_ERC20_TRANSFER,
+        &EncodeErc20TransferRequest {
+            to_address: to_address.to_owned(),
+            amount_raw: amount_raw.to_owned(),
+        },
+    )
+    .await?;
+    Ok(response.calldata)
 }
 
 /// Sign opaque bytes with the key derived from `secret`.
@@ -221,6 +284,42 @@ pub async fn export_key(
         .map_err(|error| classify(&error))
 }
 
+/// Call a typed Wallet, Web3, or x402 member with one request argument.
+/// Business rules stay in the module; the host only transports the request.
+pub async fn call<Request, Reply>(
+    config: &Config,
+    member: &str,
+    request: Request,
+) -> Result<Reply, WalletCallError>
+where
+    Request: Serialize + Send,
+    Reply: DeserializeOwned,
+{
+    let (runtime, record) = ready(config).await?;
+    proxy(runtime, record)?
+        .call::<Reply>(member, (request,))
+        .await
+        .map_err(|error| classify(&error))
+}
+
+/// Call a Wallet member carrying secret material over TinyBus's confidential
+/// transport. The loaded module must be attested and match this build's pin.
+pub async fn call_confidential<Request, Reply>(
+    config: &Config,
+    member: &str,
+    request: &Request,
+) -> Result<Reply, WalletCallError>
+where
+    Request: Serialize + Send,
+    Reply: DeserializeOwned,
+{
+    attested_proxy(config)
+        .await?
+        .call_confidential::<Reply>(member, (request,))
+        .await
+        .map_err(|error| classify(&error))
+}
+
 /// A proxy that has proved it is the artifact this build pinned.
 ///
 /// # Why check here when the broker already refuses
@@ -278,36 +377,104 @@ async fn attested_proxy(config: &Config) -> Result<tinybus::Proxy, WalletCallErr
     Ok(proxy)
 }
 
-/// Whether `sha256` is one of the artifacts this build pinned for `record`.
-///
-/// Case-insensitive because the release manifest and the pinned table are
-/// written by different hands and both are hex of the same bytes. Nothing
-/// compared here is a secret, so a constant-time comparison would buy nothing.
-///
-/// Every asset is checked rather than just the one for this platform: which
-/// artifact loaded is not recorded, and a host that fell through to an older
-/// build after an admission failure is running a pinned artifact either way.
+// Embedded library checksums verified from all 17 archives in the
+// registry-pinned TinyWallet v0.29.0 release. Each library is trusted only
+// while its archive checksum remains pinned in the supplied ModuleRecord.
+const PINNED_WALLET_LIBRARIES: &[(&str, &str)] = &[
+    // archlinux-arm64
+    (
+        "90d8cb352a9d6b6403549f053446139c0361d36354ca7c37e0bc0296eb544cae",
+        "afc105b22f2164c44b8c2b8c2f47fca18b15d3fa3f41dd32068323fef61c961d",
+    ),
+    // archlinux-x86_64
+    (
+        "8e9bc6e2d443807cbbb1759cb85896abbcc0d3294a0ec58007fe0c56aecb5a25",
+        "06437156a130c5a31b855e8da09ed0e523bf284868f3be98a801a4e48e95fe99",
+    ),
+    // fedora-43-arm64
+    (
+        "71e8ec37af5be258c111169e441fed5f4a46d9b3934c477569ec1185ec7ceba5",
+        "eee7d2940b7454e55a1a1dbdfaa019547be64ca0dac35a8defb675697a255d70",
+    ),
+    // fedora-43-x86_64
+    (
+        "3e7438212776adbe82a54a5c48ff744cd26ee73d0dee66bce7de42b968608a16",
+        "bd09a11778799d091c01889e662e0b73105564f3aed87bd6f6cc5ba646c7c5eb",
+    ),
+    // fedora-44-arm64
+    (
+        "7612aeeca130c741b38673279268494e0cf49891dd95574e14310e64634a6840",
+        "85d36fc9cb09d5115bcab86dab57841c3e4f42f3b7dc7370e9714123ff0da4ae",
+    ),
+    // fedora-44-x86_64
+    (
+        "9807227a79989d6c17be18212462751e244fb1b5f2bbe1224e0054b3f37cc188",
+        "d2bd08acfcfba51dbbbc0c98e30ee239c6b96f602804e51e1346308904a59ccf",
+    ),
+    // macos-15-arm64
+    (
+        "228b25d3ea7869436cf009bc228dc94f8f40fcf1d7ea81c622651c14b6bbc216",
+        "b0b1c14b81d53e9dad0d542b904c2a13bdd006bd0aa4161efdb7908b5dfd1018",
+    ),
+    // macos-15-x86_64
+    (
+        "0b173d7ebed6ce23c7224a55a32c9b9716471a054119b02869abc2add15dc391",
+        "c1950a184ff12d06fcbaab8ddc885634de27a8f77079d2fd4b23bd8ed769bfc4",
+    ),
+    // macos-26-arm64
+    (
+        "61ee2de3ca95cea7f8253de3e47f4da9ae42bd4ac406c65374aaf4cd22b742f3",
+        "cf525f878ee525fbc2455c5973f3fb87250ac7c5e1e10bf7da06bf987ac53ac1",
+    ),
+    // macos-26-x86_64
+    (
+        "5c7593c4bb15f806a83c25dee97e26bf86a73571046d6523164885804d0c9c7d",
+        "8dcfe0bc479614641401f666520bd557ed3908f62765f0730ed6cacbbb592aaa",
+    ),
+    // ubuntu-22.04-arm64
+    (
+        "54085d6e1391f98fb44b86735df0f147318502153c4d3e96c5586421835cb5aa",
+        "71be33a596e9a7bc85ba27c39d03dfe50dfde82d30520bed9206fcd64d82d86a",
+    ),
+    // ubuntu-22.04-x86_64
+    (
+        "4d2016fac3c2001dae9ff152dad91057741aa6c031093b10fce4a4f3e1654045",
+        "11ba204877de877aa04286c98d4748fbcdbbcdc6b0fd8e24db0632ea96c4910b",
+    ),
+    // ubuntu-24.04-arm64
+    (
+        "dedb29838c947d2da479c9998a38d772de875bd914eae0d0a8b81377bb7b894c",
+        "ebbe1494be6ba647c0d6b3162b6c830220fe87f3faf46d179369782fc3bb7b5b",
+    ),
+    // ubuntu-24.04-x86_64
+    (
+        "74036ca124938a556687ff760d83fb3ad2eebb9e91a2a9cb93873a537f8e85a3",
+        "ca77309f2d5cdb6d13e56cb7fc44145507a333f55c6a31729979a2782a4ab3ae",
+    ),
+    // windows-11-arm64
+    (
+        "5fd451a1166e64af8f5936239f22ca88deadb6ff96058e7b9295887fa8315999",
+        "24971b8592e3907fe09968abbf4c723d539559a534a89f9cfd2c64b82a218de9",
+    ),
+    // windows-2022-x86_64
+    (
+        "b272c66ade706b7cb3c443fbd05c549abc2ef024f044b1cdfeba19f61367db78",
+        "553236685e6f444902302f34a1a4f6e02991d4e07360afcb69594a934e974f38",
+    ),
+    // windows-2025-x86_64
+    (
+        "2a6b49b81af30bbe6975c7274a9c2f8cef2a3bde10a3cebae1f4c8b9c1bf5333",
+        "44c8d1070b3aab490b9b928036f20a42eee9d85e6dabd3865ba4cf3381ed6d2f",
+    ),
+];
+
 fn digest_is_pinned(record: &super::ModuleRecord, sha256: &str) -> bool {
-    let release_archive_is_pinned = record
-        .assets
-        .iter()
-        .any(|asset| asset.sha256.eq_ignore_ascii_case(sha256));
-
-    // `load_github_release` attests the checksum of its verified archive. A
-    // locally discovered artifact is instead attested from the module's own
-    // `modules.toml`, which records the library checksum. Accept the latter
-    // for the checked release artifact too, so an operator can preload the
-    // official module without changing the confidential-call policy.
-    //
-    // This is the linux x86_64 library shipped inside
-    // tinywallet-module-0.5.1-ubuntu-22.04-x86_64.tar.gz. Its archive checksum
-    // remains in the registry above; the two digests intentionally cover
-    // different bytes.
-    const TINYWALLET_0_5_1_UBUNTU_22_04_X86_64_LIBRARY_SHA256: &str =
-        "2bd70433707c44dbfe6b3cc3b4cc835299fe951fcb375b49c940d8d3fc1d4061";
-
-    release_archive_is_pinned
-        || sha256.eq_ignore_ascii_case(TINYWALLET_0_5_1_UBUNTU_22_04_X86_64_LIBRARY_SHA256)
+    record.assets.iter().any(|asset| {
+        asset.sha256.eq_ignore_ascii_case(sha256)
+            || PINNED_WALLET_LIBRARIES.iter().any(|(archive, library)| {
+                asset.sha256.eq_ignore_ascii_case(archive) && library.eq_ignore_ascii_case(sha256)
+            })
+    })
 }
 
 /// Load the wallet module if it is not already serving.
@@ -330,13 +497,19 @@ pub async fn ensure_ready(config: &Config) -> Result<(), WalletCallError> {
 /// Ensure the module is serving and hand back what a call needs.
 async fn ready(
     config: &Config,
-) -> Result<(&'static host::ModuleRuntime, &'static super::ModuleRecord), WalletCallError> {
+) -> Result<
+    (
+        &'static tinybus::module::ModuleRuntime,
+        &'static super::ModuleRecord,
+    ),
+    WalletCallError,
+> {
     ops::ensure_loaded(config, MODULE_ID)
         .await
         .map_err(WalletCallError::Unavailable)?;
     let record = registry::find(MODULE_ID)
         .ok_or_else(|| WalletCallError::Unavailable(format!("unknown module '{MODULE_ID}'")))?;
-    let runtime = host::runtime()
+    let runtime = super::runtime::runtime()
         .await
         .map_err(|_| WalletCallError::Unavailable("the module bus is not running".to_string()))?;
     Ok((runtime, record))
@@ -344,7 +517,7 @@ async fn ready(
 
 /// A proxy for the module's object.
 fn proxy(
-    runtime: &'static host::ModuleRuntime,
+    runtime: &'static tinybus::module::ModuleRuntime,
     record: &super::ModuleRecord,
 ) -> Result<tinybus::Proxy, WalletCallError> {
     runtime
@@ -375,27 +548,6 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
         out
     })
-}
-
-/// Decode lowercase hex from the module.
-fn unhex(value: &str) -> Result<Vec<u8>, WalletCallError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(WalletCallError::Failed(
-            "the module returned a payload with an odd number of hex characters".to_string(),
-        ));
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            std::str::from_utf8(pair)
-                .ok()
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                .ok_or_else(|| {
-                    WalletCallError::Failed("the module returned a non-hex payload".to_string())
-                })
-        })
-        .collect()
 }
 
 #[cfg(test)]

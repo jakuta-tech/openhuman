@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
+import { REASONING_EFFORTS } from '../../../features/conversations/aui/ReasoningEffortPicker';
+import { NODE_KIND_ICON } from '../../../lib/flows/nodeKindIcons';
+import { NODE_GROUP_ORDER } from '../../../lib/flows/nodeKindMeta';
 import enAggregate from '../en';
 
 const LOCALES = [
@@ -14,8 +17,10 @@ const LOCALES = [
   'ru',
   'id',
   'it',
+  'ja',
   'ko',
   'pl',
+  'tr',
 ] as const;
 
 interface LocaleModule {
@@ -54,19 +59,47 @@ describe('i18n coverage', () => {
     expect(extra).toEqual([]);
   });
 
+  it.each(['en', ...LOCALES])('%s translates finite dynamic UI options', locale => {
+    const flat = locale === 'en' ? enFlat : loadLocale(locale);
+    const dynamicKeys = [
+      ...REASONING_EFFORTS.map(effort => `composer.reasoning.${effort}`),
+      ...Object.keys(NODE_KIND_ICON).map(kind => `flows.nodeKind.${kind}`),
+      ...NODE_GROUP_ORDER.map(group => `flows.palette.group.${group}`),
+      ...['none', 'subtle', 'default', 'round'].map(corner => `settings.layout.corners.${corner}`),
+      ...['subtle', 'default', 'strong'].map(contrast => `settings.layout.contrast.${contrast}`),
+    ];
+    const missing = dynamicKeys.filter(key => !(key in flat));
+    expect(missing).toEqual([]);
+  });
+  it('locale tr preserves every interpolation placeholder', () => {
+    const turkish = loadLocale('tr');
+    const placeholders = (value: string) => (value.match(/\{+[^{}]+\}+/g) ?? []).sort();
+    const mismatches = Object.entries(enFlat)
+      .filter(
+        ([key, value]) =>
+          JSON.stringify(placeholders(turkish[key] ?? '')) !== JSON.stringify(placeholders(value))
+      )
+      .map(([key]) => key);
+    expect(mismatches).toEqual([]);
+  });
+
+  it('preserves Japanese interpolation placeholders exactly', () => {
+    const japanese = loadLocale('ja');
+    const placeholders = (value: string) => value.match(/\{+[^{}]+\}+/g)?.sort() ?? [];
+    const mismatches = Object.entries(enFlat)
+      .filter(
+        ([key, value]) =>
+          JSON.stringify(placeholders(japanese[key])) !== JSON.stringify(placeholders(value))
+      )
+      .map(([key]) => key);
+    expect(mismatches).toEqual([]);
+  });
+
   it.each(['en', ...LOCALES])('locale %s contains no em dashes', locale => {
     const flat = locale === 'en' ? enFlat : loadLocale(locale);
     const keysWithEmDashes = Object.entries(flat)
       .filter(([, value]) => value.includes('\u2014'))
       .map(([key]) => key);
     expect(keysWithEmDashes).toEqual([]);
-  });
-
-  // The OpenHuman Managed search option must name the provider behind it, so
-  // the managed path does not read as an unattributed black box (#5136). The
-  // provider name is a proper noun, so it stays literal in every locale.
-  it.each(['en', ...LOCALES])('locale %s names Exa in the managed search copy', locale => {
-    const flat = locale === 'en' ? enFlat : loadLocale(locale);
-    expect(flat['settings.search.engineManagedDesc']).toContain('Exa');
   });
 });

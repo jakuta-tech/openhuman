@@ -18,12 +18,33 @@ export interface CoreUpdateStatus {
   update_available: boolean;
 }
 
-export type DoctorSeverity = 'Ok' | 'Warn' | 'Error';
+export type DoctorTier = 'static' | 'connect' | 'live';
+export type DoctorSeverity = 'pass' | 'info' | 'warn' | 'error' | 'skipped';
 export type ModelProbeOutcome = 'Ok' | 'Skipped' | 'AuthOrAccess' | 'Error';
 
+export interface DoctorFinding {
+  check_id: string;
+  severity: DoctorSeverity;
+  message: string;
+  fix_hint: string;
+  config_path?: string;
+  value_source?: 'cli' | 'env' | 'dotenv' | 'file' | 'default';
+  duration_ms: number;
+  affects: string[];
+}
+
 export interface DoctorReport {
-  items: { severity: DoctorSeverity; category: string; message: string }[];
-  summary: { ok: number; warnings: number; errors: number };
+  schema_version: 2;
+  profile: string | null;
+  config_source: 'profile' | 'tenant';
+  profile_layout_version?: 1 | 2;
+  config_resolution_source?: string;
+  tier: DoctorTier;
+  checks_run: string[];
+  checks_skipped: string[];
+  findings: DoctorFinding[];
+  summary: { pass: number; info: number; warn: number; error: number; skipped: number };
+  ok: boolean;
 }
 
 export interface ModelProbeReport {
@@ -284,7 +305,7 @@ export async function getOnboardingCompleted(): Promise<boolean> {
   const res = await callCoreRpc<boolean | { result: boolean }>({
     method: 'openhuman.config_get_onboarding_completed',
   });
-  // RpcOutcome may wrap value in { result, logs } when logs are present
+  // Outcome may wrap value in { result, logs } when logs are present
   if (typeof res === 'boolean') return res;
   if (res && typeof res === 'object' && 'result' in res) return res.result;
   return false;
@@ -305,19 +326,18 @@ export async function setOnboardingCompleted(value: boolean): Promise<boolean> {
   return false;
 }
 
-export async function openhumanDoctorReport(): Promise<CommandResponse<DoctorReport>> {
-  if (!isTauri()) {
-    throw new Error('Not running in Tauri');
-  }
-  return await callCoreRpc<CommandResponse<DoctorReport>>({ method: 'openhuman.doctor_report' });
+export async function openhumanDoctorReport(
+  tier: DoctorTier = 'connect'
+): Promise<CommandResponse<DoctorReport>> {
+  return await callCoreRpc<CommandResponse<DoctorReport>>({
+    method: 'openhuman.doctor_report',
+    params: { tier },
+  });
 }
 
 export async function openhumanDoctorModels(
   useCache = true
 ): Promise<CommandResponse<ModelProbeReport>> {
-  if (!isTauri()) {
-    throw new Error('Not running in Tauri');
-  }
   return await callCoreRpc<CommandResponse<ModelProbeReport>>({
     method: 'openhuman.doctor_models',
     params: { use_cache: useCache },
@@ -328,9 +348,6 @@ export async function openhumanMigrateOpenclaw(
   sourceWorkspace?: string,
   dryRun = true
 ): Promise<CommandResponse<MigrationReport>> {
-  if (!isTauri()) {
-    throw new Error('Not running in Tauri');
-  }
   return await callCoreRpc<CommandResponse<MigrationReport>>({
     method: 'openhuman.migrate_openclaw',
     params: { source_workspace: sourceWorkspace, dry_run: dryRun },
@@ -341,9 +358,6 @@ export async function openhumanMigrateHermes(
   sourceWorkspace?: string,
   dryRun = true
 ): Promise<CommandResponse<MigrationReport>> {
-  if (!isTauri()) {
-    throw new Error('Not running in Tauri');
-  }
   return await callCoreRpc<CommandResponse<MigrationReport>>({
     method: 'openhuman.migrate_hermes',
     params: { source_workspace: sourceWorkspace, dry_run: dryRun },

@@ -23,6 +23,10 @@ impl DashboardModelHealthTool {
 
 #[async_trait]
 impl Tool for DashboardModelHealthTool {
+    fn exposure(&self) -> tinytools::ToolExposure {
+        tinytools::ToolExposure::Deferred
+    }
+
     fn name(&self) -> &str {
         "dashboard_model_health"
     }
@@ -47,6 +51,13 @@ impl Tool for DashboardModelHealthTool {
     fn is_concurrency_safe(&self, _args: &serde_json::Value) -> bool {
         true
     }
+}
+
+/// Build this domain's tools in their persisted catalogue order.
+pub(crate) fn registered_tools(
+    config: std::sync::Arc<crate::config::Config>,
+) -> Vec<Box<dyn tinytools::Tool>> {
+    vec![Box::new(DashboardModelHealthTool::new(config.clone()))]
 }
 
 #[cfg(test)]

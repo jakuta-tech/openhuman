@@ -10,6 +10,7 @@ import {
 import reducer, {
   clipQueuePreview,
   pendingFollowupAdded,
+  pendingFollowupCompleted,
   queueItemDelivered,
   queueItemQueued,
   queueItemRemoved,
@@ -67,7 +68,7 @@ describe('queueSlice — core run-queue items', () => {
     expect(state.itemsByThread.t1).toBeUndefined();
   });
 
-  it('keeps pending follow-ups when an item is delivered (they persist on turn end)', () => {
+  it('keeps pending follow-ups after the core delivers their queue item', () => {
     let state = reducer(
       undefined,
       pendingFollowupAdded({ threadId: 't1', message: message('m1', 'hi'), text: 'hi' })
@@ -151,13 +152,15 @@ describe('queueSlice — chat runtime lifecycle', () => {
     );
   };
 
-  it('endInferenceTurn clears the thread queue (its follow-ups are being dispatched)', () => {
+  it('keeps pending follow-ups until their own persisted terminal event', () => {
     let state = reducer(seeded(), beginInferenceTurn({ threadId: 't1' }));
     state = reducer(state, endInferenceTurn({ threadId: 't1' }));
 
     expect(state.itemsByThread.t1).toBeUndefined();
-    expect(state.pendingFollowupsByThread.t1).toBeUndefined();
+    expect(state.pendingFollowupsByThread.t1).toHaveLength(1);
     expect(state.itemsByThread.t2).toBeDefined();
+    state = reducer(state, pendingFollowupCompleted({ threadId: 't1', requestId: 'm1' }));
+    expect(state.pendingFollowupsByThread.t1).toBeUndefined();
   });
 
   it('clearRuntimeForThread clears one thread, clearAllChatRuntime clears all', () => {
@@ -172,11 +175,79 @@ describe('queueSlice — chat runtime lifecycle', () => {
 });
 
 describe('clipQueuePreview', () => {
+  it('matches raw and staged file-only previews using decoded original filenames', () => {
+    const raw = '[FILE:data:application/zip;name=Archive%20%F0%9F%98%80.zip;base64,AQID]';
+    const staged = `[ATTACHMENT:${encodeURIComponent(JSON.stringify({ path: 'uploads/t/id/Archive.zip', name: 'Archive 😀.zip', mime: 'application/zip', size_bytes: 3 }))}]`;
+    expect(clipQueuePreview(raw)).toBe('Archive 😀.zip');
+    expect(clipQueuePreview(staged)).toBe(clipQueuePreview(raw));
+    expect(clipQueuePreview('[IMAGE:data:image/png;base64,AQID]')).toBe('attachment');
+  });
+
+  it('keeps short captions stable across staging and preserves intentional paragraph breaks', () => {
+    const raw = '[IMAGE:data:image/png;name=photo.png;base64,AQID]';
+    const staged = `[ATTACHMENT:${encodeURIComponent(JSON.stringify({ path: 'uploads/t/id/photo.png', name: 'photo.png', mime: 'image/png', size_bytes: 3 }))}]`;
+    expect(clipQueuePreview(`Look  here ${raw}`)).toBe('Look here');
+    expect(clipQueuePreview(`Look  here ${staged}`)).toBe('Look here');
+    expect(clipQueuePreview(`first\n\nsecond ${raw}`)).toBe('first\n\nsecond');
+  });
+
+  it('joins file-only names in source order without decoding payload bytes', () => {
+    const staged = `[ATTACHMENT:${encodeURIComponent(JSON.stringify({ path: 'uploads/t/id/a.zip', name: 'a.zip', mime: 'application/zip', size_bytes: 3 }))}]`;
+    expect(clipQueuePreview(`${staged} [IMAGE:data:image/png;name=b.png;base64,not-base64]`)).toBe(
+      'a.zip, b.png'
+    );
+  });
+
+  it('removes a pending raw upload when the core cancels its staged queue item', () => {
+    const raw = '[FILE:data:application/zip;name=archive.zip;base64,AQID]';
+    const staged = `[ATTACHMENT:${encodeURIComponent(JSON.stringify({ path: 'uploads/t/id/archive.zip', name: 'archive.zip', mime: 'application/zip', size_bytes: 3 }))}]`;
+    let state = reducer(
+      undefined,
+      pendingFollowupAdded({ threadId: 't-upload', message: message('m-upload', raw), text: raw })
+    );
+    state = reducer(state, queued('t-upload', 'q-upload', clipQueuePreview(staged)));
+    state = reducer(state, queueItemRemoved({ threadId: 't-upload', itemId: 'q-upload' }));
+    expect(state.pendingFollowupsByThread['t-upload']).toBeUndefined();
+    expect(state.itemsByThread['t-upload']).toBeUndefined();
+  });
+
   it('matches the core clip: 80 code points, then an ellipsis', () => {
     expect(clipQueuePreview('short')).toBe('short');
     expect(clipQueuePreview('x'.repeat(80))).toBe('x'.repeat(80));
     expect(clipQueuePreview('x'.repeat(81))).toBe(`${'x'.repeat(80)}…`);
     // Astral characters count once, as Rust's `chars()` does.
     expect(clipQueuePreview('😀'.repeat(81))).toBe(`${'😀'.repeat(80)}…`);
+  });
+});
+
+describe('clipQueuePreview with typed attachments', () => {
+  const file = (name?: string) => ({
+    kind: 'file' as const,
+    fileName: name ?? null,
+    caption: null,
+    media: {
+      kind: 'document' as const,
+      url: 'data:application/pdf;base64,AAA',
+      fileName: name ?? null,
+      contentType: null,
+      sizeBytes: null,
+      codec: null,
+      durationMs: null,
+      height: null,
+      localCachePath: null,
+      path: null,
+      platformMessageId: null,
+      transcribed: false,
+      width: null,
+    },
+  });
+
+  it('uses the caption when there is one', () => {
+    expect(clipQueuePreview('see this', [file('a.pdf')])).toBe('see this');
+  });
+
+  it('falls back to the attachment file names when there is no caption', () => {
+    expect(clipQueuePreview('', [file('a.pdf'), file('b.pdf')])).toBe('a.pdf, b.pdf');
+    expect(clipQueuePreview('', [file()])).toBe('attachment');
   });
 });
